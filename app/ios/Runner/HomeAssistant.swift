@@ -63,6 +63,7 @@ final class HomeAssistant {
     urls.removeAll { !seen.insert($0).inserted }
     return urls
   }
+  // Home Assistant derives the notify service from this registration name.
   var name: String { "Protect Fast iOS \(deviceID)" }
   var automationID: String { "protect_fast_ios_\(deviceID)" }
   private var notifyService: String { "mobile_app_\(automationID)" }
@@ -307,7 +308,7 @@ final class HomeAssistant {
       let appID = Bundle.main.bundleIdentifier ?? "nl.niek.protect-fast"
       let response = try await request(at: endpoint, path: "api/mobile_app/registrations",
                                        token: token, json: deviceInfo.merging([
-        "device_id": deviceID, "app_id": appID, "app_name": "Protect Fast",
+        "device_id": deviceID, "app_id": appID, "app_name": "Doorbell Companion",
         "os_name": "iOS", "supports_encryption": false,
       ]) { _, new in new })
       guard let object = try JSONSerialization.jsonObject(with: response) as? JSON,
@@ -349,7 +350,7 @@ final class HomeAssistant {
       ])
     }
     _ = try await request(at: endpoint, path: path, token: token, json: [
-      "id": automationID, "alias": "Protect Fast: Doorbell Call (\(name))",
+      "id": automationID, "alias": "Doorbell Companion: Doorbell Call (iOS \(deviceID))",
       "mode": "parallel", "triggers": triggers, "conditions": [], "actions": [["choose": branches]],
     ])
     defaults.set(automationState, forKey: "synced_automation")

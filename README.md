@@ -1,19 +1,19 @@
-# Protect Fast
+# Doorbell Companion
 
-Fast incoming doorbell calls for **Home Assistant** on **Android and iOS**. Protect Fast works with Home Assistant doorbell cameras, including **UniFi Protect**, and starts connecting to your camera while the phone rings.
+Fast incoming doorbell calls for **Home Assistant** on **Android and iOS**. Doorbell Companion works with Home Assistant doorbell cameras, including **UniFi Protect**, and starts connecting to your camera while the phone rings.
 
 | Platform | Incoming call |
 | --- | --- |
 | **Android** | A full-screen lock-screen call shows a snapshot and switches to live video as soon as the first frame arrives. |
-| **iOS** | The native CallKit screen rings on the lock screen. Answer to open Protect Fast with a snapshot, live video, and audio. |
+| **iOS** | The native CallKit screen rings on the lock screen. Answer to open Doorbell Companion with a snapshot, live video, and audio. |
 
 ## Features
 
-- **Automatic setup.** Discover Home Assistant over Wi-Fi, sign in through your browser, and let Protect Fast find your doorbells, register your phone, and create the ring automation.
+- **Automatic setup.** Discover Home Assistant over Wi-Fi, sign in through your browser, and let Doorbell Companion find your doorbells, register your phone, and create the ring automation.
 - **Fast camera preview.** Fetch a snapshot and start WebRTC signaling as soon as the push arrives. The snapshot stays visible until the live feed renders.
-- **Local and remote connections.** Protect Fast tries your local and external Home Assistant WebSockets in parallel when both addresses are available.
+- **Local and remote connections.** Doorbell Companion tries your local and external Home Assistant WebSockets in parallel when both addresses are available.
 - **Live audio and talkback.** Hear the visitor when you answer. The microphone and mute control are available when Home Assistant and the camera support two-way audio over WebRTC.
-- **Multiple doorbells.** Turn individual doorbells on or off in Settings. Protect Fast keeps the Home Assistant automation in sync.
+- **Multiple doorbells.** Turn individual doorbells on or off in Settings. Doorbell Companion keeps the Home Assistant automation in sync.
 - **Stateless push relay.** The Cloudflare Worker forwards Home Assistant notifications to Firebase Cloud Messaging for Android and Apple Push Notification service (APNs) for iOS.
 
 ## How it works
@@ -55,8 +55,8 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
 ## Connect Home Assistant
 
-1. Open **Protect Fast** on Wi-Fi and select your discovered instance, or enter its URL manually.
-2. Sign in through your browser. Protect Fast discovers your doorbells and creates the Home Assistant automation.
+1. Open **Doorbell Companion** on Wi-Fi and select your discovered instance, or enter its URL manually.
+2. Sign in through your browser. Doorbell Companion discovers your doorbells and creates the Home Assistant automation.
 3. On Android, grant **Notifications** and **Full-screen lockscreen calls** when prompted. On either platform, grant **Microphone** if you want to use talkback with a compatible camera.
 4. Tap **Test call** to check video and audio. To check the full push path, tap **Test HA push (3s delay)** and lock your phone.
 
@@ -69,10 +69,10 @@ The app defaults to the hosted relay. To run your own Cloudflare Worker, configu
 
 ## Performance and diagnostics
 
-- **UniFi Protect.** Enable the medium-resolution camera entity in Home Assistant and tap **Refresh** in Protect Fast Settings. Protect Fast prefers that channel when available, which can reduce startup time on cellular connections.
-- **Android cold starts.** Protect Fast caches ICE configuration and uses a long-lived Home Assistant token to reduce round trips when a call arrives.
+- **UniFi Protect.** Enable the medium-resolution camera entity in Home Assistant and tap **Refresh** in Doorbell Companion Settings. Doorbell Companion prefers that channel when available, which can reduce startup time on cellular connections.
+- **Android cold starts.** Doorbell Companion caches ICE configuration and uses a long-lived Home Assistant token to reduce round trips when a call arrives.
 - **Android timings.** Run `adb logcat -s ProtectTiming:I ProtectFast:I` to see elapsed times from push receipt through signaling, the snapshot, and the first live frame.
-- **iOS timings.** Filter the Xcode device console for `Protect Fast` to see incoming call and playback events.
+- **iOS timings.** Filter the Xcode device console for `Doorbell Companion` to see incoming call and playback events.
 
 ## Repository structure
 

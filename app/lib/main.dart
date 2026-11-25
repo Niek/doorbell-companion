@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+const _appName = 'Doorbell Companion';
+
 void main() => runApp(const ProtectFastApp());
 
 class DoorbellItem {
@@ -257,7 +259,7 @@ class _ProtectFastAppState extends State<ProtectFastApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'Protect Fast',
+    title: _appName,
     debugShowCheckedModeBanner: false,
     themeMode: ThemeMode.system,
     theme: _buildTheme(Brightness.light),
@@ -291,7 +293,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final st = widget.controller.status;
       return Scaffold(
         appBar: AppBar(
-          title: const Text('Protect Fast'),
+          title: const Text(_appName),
           actions: [
             if (st.haConnected)
               IconButton(
@@ -631,7 +633,7 @@ class SettingsScreen extends StatelessWidget {
       builder: (ctx) => AlertDialog(
         title: const Text('Disconnect Home Assistant?'),
         content: const Text(
-          'This removes the Protect Fast doorbell automation from Home Assistant and signs out on this phone.',
+          'This removes the Doorbell Companion doorbell automation from Home Assistant and signs out on this phone.',
         ),
         actions: [
           TextButton(

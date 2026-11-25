@@ -49,7 +49,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       } catch {
         guard !Task.isCancelled else { return }
         self.status = "Could not connect to the camera"
-        NSLog("Protect Fast camera: %@", error.localizedDescription)
+        NSLog("Doorbell Companion camera: %@", error.localizedDescription)
         self.didChange?()
         self.didFail?(error)
       }
@@ -283,7 +283,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
 
   private func mark(_ stage: String) {
     let elapsed = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
-    NSLog("Protect Fast timing: %@ elapsed_ms=%d", stage, elapsed)
+    NSLog("Doorbell Companion timing: %@ elapsed_ms=%d", stage, elapsed)
   }
 
   nonisolated func peerConnection(_ peerConnection: RTCPeerConnection,

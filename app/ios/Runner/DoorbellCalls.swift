@@ -99,7 +99,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
       Task { @MainActor in
         guard let self else { return }
         if let error {
-          NSLog("Protect Fast CallKit: %@", error.localizedDescription)
+          NSLog("Doorbell Companion CallKit: %@", error.localizedDescription)
           if available { self.finish(id) }
         } else if !available {
           self.provider.reportCall(with: id, endedAt: Date(), reason: .failed)
@@ -107,7 +107,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
       }
     }
     if available {
-      NSLog("Protect Fast CallKit: VoIP invite reported")
+      NSLog("Doorbell Companion CallKit: VoIP invite reported")
       prewarmBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Connect doorbell camera") {
         [weak self] in
         Task { @MainActor in self?.endPrewarmBackgroundTask() }
@@ -132,7 +132,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
       try AVAudioSession.sharedInstance().setActive(true)
       setAudioActive(true)
     } catch {
-      NSLog("Protect Fast test audio: %@", error.localizedDescription)
+      NSLog("Doorbell Companion test audio: %@", error.localizedDescription)
     }
     media.answer()
     media.start()
@@ -216,7 +216,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
         .playAndRecord, mode: .videoChat, options: [.defaultToSpeaker, .allowBluetoothHFP]
       )
     } catch {
-      NSLog("Protect Fast audio: %@", error.localizedDescription)
+      NSLog("Doorbell Companion audio: %@", error.localizedDescription)
     }
   }
 

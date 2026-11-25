@@ -128,9 +128,9 @@ export default {
     const { pathname } = new URL(request.url);
     if (pathname === '/ios' && request.method === 'GET') {
       return new Response(
-        '<!doctype html><html><head><title>Protect Fast iOS</title>'
+        '<!doctype html><html><head><title>Doorbell Companion iOS</title>'
         + '<link rel="redirect_uri" href="protect-fast://auth-callback">'
-        + '</head><body>Protect Fast for iOS</body></html>',
+        + '</head><body>Doorbell Companion for iOS</body></html>',
         { headers: { 'content-type': 'text/html; charset=utf-8' } },
       );
     }

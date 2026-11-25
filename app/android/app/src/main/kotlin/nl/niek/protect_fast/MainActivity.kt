@@ -321,7 +321,7 @@ class MainActivity : FlutterActivity() {
                             val html = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
                                 "<meta http-equiv=\"refresh\" content=\"0;url=protectfast://auth-done\"></head>" +
                                 "<body style=\"font-family:sans-serif;padding:32px;text-align:center\">" +
-                                "<h2>Connected to Protect Fast</h2><p>Returning to the app…</p></body></html>"
+                                "<h2>Connected to Doorbell Companion</h2><p>Returning to the app…</p></body></html>"
                             val resp = "HTTP/1.1 302 Found\r\n" +
                                 "Location: protectfast://auth-done\r\n" +
                                 "Content-Type: text/html; charset=utf-8\r\n" +

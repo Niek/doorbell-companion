@@ -1,10 +1,10 @@
-# Protect Fast Push Relay Worker
+# Doorbell Companion Push Relay Worker
 
-Stateless Cloudflare Worker acting as the Home Assistant `mobile_app` `push_url` relay (`POST /push`) for Protect Fast.
+Stateless Cloudflare Worker that relays Home Assistant doorbell notifications for Doorbell Companion. Android uses FCM through `/push`, and iOS uses APNs VoIP through `/push/ios`.
 
 Home Assistant passes each user's Firebase registration token (`push_token`) directly in the `POST /push` request body, so a single deployed Worker serves any number of Home Assistant installations with zero database or stored user state.
 
-## Setup
+## Android setup
 
 1. Create a Firebase project for `nl.niek.protect_fast`, enable the FCM API, and download a service account JSON key with permission to send FCM messages.
 2. Set the secret and deploy:
@@ -14,11 +14,11 @@ Home Assistant passes each user's Firebase registration token (`push_token`) dir
    npx wrangler deploy
    ```
 
-3. Point `PUSH_RELAY_URL` in `app/android/app/src/main/kotlin/nl/niek/protect_fast/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev/push` (or use the hosted default). Signing in to Home Assistant in Protect Fast sets up automatic ring notifications.
+3. Point `PUSH_RELAY_URL` in `app/android/app/src/main/kotlin/nl/niek/protect_fast/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev/push` (or use the hosted default). Signing in to Home Assistant in Doorbell Companion sets up automatic ring notifications.
 
 ## iOS VoIP pushes
 
-Create an APNs signing key for the Protect Fast VoIP topic. Store a JSON secret named `APNS_SANDBOX_AUTH` for Debug builds and `APNS_PRODUCTION_AUTH` for production builds. The JSON fields are `team_id`, `key_id`, and `private_key`. The last field is the full PEM contents of the `.p8` key. An existing key that supports both environments can be stored as `APNS_AUTH`.
+Create an APNs signing key for the Doorbell Companion VoIP topic. Store a JSON secret named `APNS_SANDBOX_AUTH` for Debug builds and `APNS_PRODUCTION_AUTH` for production builds. The JSON fields are `team_id`, `key_id`, and `private_key`. The last field is the full PEM contents of the `.p8` key. An existing key that supports both environments can be stored as `APNS_AUTH`.
 
 ```sh
 npx wrangler secret put APNS_SANDBOX_AUTH < /path/to/apns-sandbox-auth.json

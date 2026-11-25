@@ -412,7 +412,7 @@ object HomeAssistantAuth {
                                         JSONObject()
                                             .put("id", 902)
                                             .put("type", "auth/long_lived_access_token")
-                                            .put("client_name", "${deviceName()} (${System.currentTimeMillis() / 1000})")
+                                            .put("client_name", "Doorbell Companion ${Build.MODEL} (${System.currentTimeMillis() / 1000})")
                                             .put("lifespan", 3650)
                                             .toString()
                                     )
@@ -594,7 +594,7 @@ object HomeAssistantAuth {
             val regBody = JSONObject()
                 .put("device_id", "protect_fast_${sanitizeSlug(Build.MODEL)}")
                 .put("app_id", "nl.niek.protect_fast")
-                .put("app_name", "Protect Fast")
+                .put("app_name", "Doorbell Companion")
                 .put("app_version", "1.0.0")
                 .put("device_name", devName)
                 .put("manufacturer", Build.MANUFACTURER)
@@ -679,8 +679,8 @@ object HomeAssistantAuth {
 
         val automationConfig = JSONObject()
             .put("id", autoId)
-            .put("alias", "Protect Fast: Doorbell Call ($devName)")
-            .put("description", "Sends instant doorbell ring call push to Protect Fast")
+            .put("alias", "Doorbell Companion: Doorbell Call (${Build.MODEL})")
+            .put("description", "Sends doorbell call notifications to Doorbell Companion")
             .put("mode", "parallel")
             .put("triggers", triggers)
             .put("conditions", JSONArray())
@@ -774,6 +774,7 @@ object HomeAssistantAuth {
         }
 
     private fun sanitizeSlug(raw: String): String = raw.lowercase().replace(nonAlnum, "_").trim('_')
+    // Home Assistant derives the notify service and automation ID from this registration name.
     private fun deviceName(): String = "Protect Fast ${Build.MODEL}"
     private fun deviceSlug(): String = "mobile_app_${sanitizeSlug(deviceName())}"
     private fun automationId(): String = "protect_fast_${sanitizeSlug(deviceName())}"
