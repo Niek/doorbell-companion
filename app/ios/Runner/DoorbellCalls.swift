@@ -34,6 +34,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     configuration.maximumCallGroups = 1
     configuration.maximumCallsPerCallGroup = 1
     configuration.includesCallsInRecents = false
+    configuration.iconTemplateImageData = UIImage(named: "CallKitIcon")?.pngData()
     provider = CXProvider(configuration: configuration)
     super.init()
     provider.setDelegate(self, queue: .main)

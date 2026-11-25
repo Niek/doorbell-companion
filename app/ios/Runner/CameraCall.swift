@@ -335,8 +335,13 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   private let video = RTCMTLVideoView()
   private let snapshot = UIImageView()
   private let statusLabel = UILabel()
-  private let muteButton = UIButton(type: .system)
+  private let statusDot = UIView()
+  private let muteButton = CallControl(symbol: "mic.fill", title: "Mute", color: UIColor(white: 1, alpha: 0.22))
+  private let topShade = GradientView(colors: [UIColor(white: 0, alpha: 0.7), .clear])
+  private let bottomShade = GradientView(colors: [.clear, UIColor(white: 0, alpha: 0.75)])
   private var track: RTCVideoTrack?
+  private var fillsScreen = true
+  private var live = false
 
   init(call: CameraCall, endCall: @escaping () -> Void) {
     self.call = call
@@ -347,61 +352,91 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
 
   required init?(coder: NSCoder) { nil }
 
+  override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
-    video.videoContentMode = .scaleAspectFit
     video.delegate = self
-    snapshot.contentMode = .scaleAspectFit
+    snapshot.clipsToBounds = true
+    applyContentMode()
+    for child in [video, snapshot, topShade, bottomShade] {
+      view.addSubview(child)
+      child.translatesAutoresizingMaskIntoConstraints = false
+    }
+    pin(video, to: view)
+    pin(snapshot, to: view)
+    view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggleContentMode)))
+
     let title = UILabel()
     title.text = call.bell.name
-    title.font = .preferredFont(forTextStyle: .title2)
+    title.font = UIFontMetrics(forTextStyle: .title1).scaledFont(for: .systemFont(ofSize: 28, weight: .semibold))
+    title.adjustsFontForContentSizeCategory = true
     title.textColor = .white
     title.textAlignment = .center
-    title.adjustsFontForContentSizeCategory = true
-    statusLabel.textAlignment = .center
-    statusLabel.textColor = .white
-    statusLabel.numberOfLines = 0
+    title.numberOfLines = 2
 
-    muteButton.setTitle("Mute", for: .normal)
+    statusLabel.font = .preferredFont(forTextStyle: .subheadline)
+    statusLabel.adjustsFontForContentSizeCategory = true
+    statusLabel.textColor = UIColor(white: 1, alpha: 0.92)
+    statusLabel.numberOfLines = 2
+    statusDot.layer.cornerRadius = 4
+    statusDot.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      statusDot.widthAnchor.constraint(equalToConstant: 8),
+      statusDot.heightAnchor.constraint(equalToConstant: 8),
+    ])
+    let statusRow = UIStackView(arrangedSubviews: [statusDot, statusLabel])
+    statusRow.spacing = 8
+    statusRow.alignment = .center
+    let chip = UIView()
+    chip.backgroundColor = UIColor(white: 0.06, alpha: 0.55)
+    chip.layer.cornerRadius = 15
+    chip.layer.cornerCurve = .continuous
+    chip.addSubview(statusRow)
+    statusRow.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      statusRow.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 14),
+      statusRow.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -14),
+      statusRow.topAnchor.constraint(equalTo: chip.topAnchor, constant: 6),
+      statusRow.bottomAnchor.constraint(equalTo: chip.bottomAnchor, constant: -6),
+    ])
+    let header = UIStackView(arrangedSubviews: [title, chip])
+    header.axis = .vertical
+    header.alignment = .center
+    header.spacing = 10
+
     muteButton.addAction(UIAction { [weak self] _ in
       guard let self else { return }
-      muteButton.setTitle(call.toggleMute() ? "Unmute" : "Mute", for: .normal)
+      let muted = call.toggleMute()
+      muteButton.update(symbol: muted ? "mic.slash.fill" : "mic.fill", title: muted ? "Unmute" : "Mute")
     }, for: .touchUpInside)
-    var endConfig = UIButton.Configuration.filled()
-    endConfig.title = "End call"
-    endConfig.baseBackgroundColor = .systemRed
-    let endButton = UIButton(configuration: endConfig, primaryAction: UIAction { [weak self] _ in
-      self?.endCall()
-    })
+    let endButton = CallControl(symbol: "phone.down.fill", title: "End", color: .systemRed)
+    endButton.addAction(UIAction { [weak self] _ in self?.endCall() }, for: .touchUpInside)
     let buttons = UIStackView(arrangedSubviews: [muteButton, endButton])
-    buttons.spacing = 24
-    let header = UIStackView(arrangedSubviews: [title, statusLabel])
-    header.axis = .vertical
-    header.spacing = 4
-    let preview = UIView()
-    for child in [video, snapshot] {
-      preview.addSubview(child)
+    buttons.spacing = 56
+    buttons.alignment = .top
+
+    for child in [header, buttons] {
+      view.addSubview(child)
       child.translatesAutoresizingMaskIntoConstraints = false
-      child.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-      NSLayoutConstraint.activate([
-        child.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
-        child.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
-        child.topAnchor.constraint(equalTo: preview.topAnchor),
-        child.bottomAnchor.constraint(equalTo: preview.bottomAnchor),
-      ])
     }
-    let content = UIStackView(arrangedSubviews: [header, preview, buttons])
-    content.axis = .vertical
-    content.spacing = 12
-    view.addSubview(content)
-    content.translatesAutoresizingMaskIntoConstraints = false
     let guide = view.safeAreaLayoutGuide
     NSLayoutConstraint.activate([
-      content.topAnchor.constraint(equalTo: guide.topAnchor, constant: 12),
-      content.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -12),
-      content.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 16),
-      content.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -16),
+      header.topAnchor.constraint(equalTo: guide.topAnchor, constant: 16),
+      header.leadingAnchor.constraint(greaterThanOrEqualTo: guide.leadingAnchor, constant: 20),
+      header.trailingAnchor.constraint(lessThanOrEqualTo: guide.trailingAnchor, constant: -20),
+      header.centerXAnchor.constraint(equalTo: guide.centerXAnchor),
+      buttons.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -24),
+      buttons.centerXAnchor.constraint(equalTo: guide.centerXAnchor),
+      topShade.topAnchor.constraint(equalTo: view.topAnchor),
+      topShade.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      topShade.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      topShade.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: 40),
+      bottomShade.topAnchor.constraint(equalTo: buttons.topAnchor, constant: -56),
+      bottomShade.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      bottomShade.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      bottomShade.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
     call.didChange = { [weak self] in self?.update() }
     update()
@@ -412,8 +447,29 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
     track = nil
   }
 
+  private func pin(_ child: UIView, to parent: UIView) {
+    NSLayoutConstraint.activate([
+      child.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+      child.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+      child.topAnchor.constraint(equalTo: parent.topAnchor),
+      child.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
+    ])
+  }
+
+  @objc private func toggleContentMode() {
+    fillsScreen.toggle()
+    UIView.animate(withDuration: 0.2) { self.applyContentMode() }
+  }
+
+  private func applyContentMode() {
+    video.videoContentMode = fillsScreen ? .scaleAspectFill : .scaleAspectFit
+    snapshot.contentMode = fillsScreen ? .scaleAspectFill : .scaleAspectFit
+  }
+
   private func update() {
     statusLabel.text = call.status
+    live = call.status == "Live"
+    statusDot.backgroundColor = live ? .systemGreen : .systemOrange
     muteButton.isHidden = !call.canMute
     snapshot.image = call.snapshot
     if track !== call.video {
@@ -430,4 +486,73 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
       self?.call.renderedFirstFrame()
     }
   }
+}
+
+/// A round call-screen button with a caption, matching the system call UI.
+private final class CallControl: UIControl {
+  private let circle = UIView()
+  private let icon = UIImageView()
+  private let caption = UILabel()
+
+  init(symbol: String, title: String, color: UIColor) {
+    super.init(frame: .zero)
+    circle.backgroundColor = color
+    circle.layer.cornerRadius = 36
+    circle.isUserInteractionEnabled = false
+    icon.tintColor = .white
+    icon.contentMode = .center
+    icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 26, weight: .semibold)
+    caption.font = .preferredFont(forTextStyle: .footnote)
+    caption.textColor = .white
+    caption.textAlignment = .center
+    for child in [circle, icon, caption] {
+      addSubview(child)
+      child.translatesAutoresizingMaskIntoConstraints = false
+    }
+    NSLayoutConstraint.activate([
+      circle.widthAnchor.constraint(equalToConstant: 72),
+      circle.heightAnchor.constraint(equalToConstant: 72),
+      circle.topAnchor.constraint(equalTo: topAnchor),
+      circle.centerXAnchor.constraint(equalTo: centerXAnchor),
+      circle.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor),
+      icon.centerXAnchor.constraint(equalTo: circle.centerXAnchor),
+      icon.centerYAnchor.constraint(equalTo: circle.centerYAnchor),
+      caption.topAnchor.constraint(equalTo: circle.bottomAnchor, constant: 8),
+      caption.leadingAnchor.constraint(equalTo: leadingAnchor),
+      caption.trailingAnchor.constraint(equalTo: trailingAnchor),
+      caption.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+    isAccessibilityElement = true
+    accessibilityTraits = .button
+    update(symbol: symbol, title: title)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  func update(symbol: String, title: String) {
+    icon.image = UIImage(systemName: symbol)
+    caption.text = title
+    accessibilityLabel = title
+  }
+
+  override var isHighlighted: Bool {
+    didSet { circle.alpha = isHighlighted ? 0.7 : 1 }
+  }
+
+  // Keep the parent's tap-to-toggle-fill gesture from swallowing button taps.
+  override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    !(gestureRecognizer is UITapGestureRecognizer && gestureRecognizer.view !== self)
+  }
+}
+
+private final class GradientView: UIView {
+  override class var layerClass: AnyClass { CAGradientLayer.self }
+
+  init(colors: [UIColor]) {
+    super.init(frame: .zero)
+    isUserInteractionEnabled = false
+    (layer as? CAGradientLayer)?.colors = colors.map(\.cgColor)
+  }
+
+  required init?(coder: NSCoder) { nil }
 }

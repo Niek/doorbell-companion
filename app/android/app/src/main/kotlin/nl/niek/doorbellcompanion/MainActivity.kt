@@ -162,21 +162,41 @@ class MainActivity : FlutterActivity() {
                         try {
                             Thread.sleep(3_000L)
                             HomeAssistantAuth.sendTestPushViaHa(applicationContext)
+                            main.post { result.success(null) }
                         } catch (e: Exception) {
                             Log.w("DoorbellCompanion", "Remote test push failed: ${e.message}")
+                            main.post {
+                                result.error("TEST_PUSH_FAILED", e.message ?: "Could not send the test call", null)
+                            }
                         }
                     }
-                    result.success(null)
                 }
 
                 "requestPermissions" -> {
                     when (call.argument<String>("type")) {
                         "notifications" -> {
-                            if (Build.VERSION.SDK_INT >= 33) {
+                            val canAsk = Build.VERSION.SDK_INT >= 33 &&
+                                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+                                canShowPermissionDialog(Manifest.permission.POST_NOTIFICATIONS)
+                            if (canAsk) {
                                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                            } else {
+                                // Denied twice, or notifications/channel switched off in system settings.
+                                openSettings(
+                                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                        .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                                )
                             }
                         }
-                        "microphone" -> requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+                        "microphone" -> {
+                            if (canShowPermissionDialog(Manifest.permission.RECORD_AUDIO)) {
+                                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+                            } else {
+                                openSettings(
+                                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                                )
+                            }
+                        }
                         "fullScreen" -> {
                             if (Build.VERSION.SDK_INT >= 34) {
                                 startActivity(
@@ -203,7 +223,27 @@ class MainActivity : FlutterActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val prefs = HomeAssistantAuth.prefs(this).edit()
+        permissions.forEach { prefs.putBoolean("asked_permission_$it", true) }
+        prefs.apply()
         pushStatusToFlutter()
+    }
+
+    /**
+     * Android stops showing the permission dialog after the user denies it twice. Once we have
+     * asked before and the system no longer wants a rationale, the dialog would silently no-op.
+     */
+    private fun canShowPermissionDialog(permission: String): Boolean {
+        val askedBefore = HomeAssistantAuth.prefs(this).getBoolean("asked_permission_$permission", false)
+        return !askedBefore || shouldShowRequestPermissionRationale(permission)
+    }
+
+    private fun openSettings(intent: Intent) {
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }
     }
 
     private fun buildStatusMap(): Map<String, Any?> {
@@ -220,9 +260,8 @@ class MainActivity : FlutterActivity() {
             )
         }
         val firstCameraName = (doorbells.firstOrNull { it.cameraEntityId !in disabled } ?: doorbells.firstOrNull())?.name ?: ""
-        val notifGranted = if (Build.VERSION.SDK_INT >= 33) {
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        } else true
+        // Covers the runtime permission and the app-level switch in system settings.
+        val notifGranted = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
         val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val fullScreenGranted = if (Build.VERSION.SDK_INT >= 34) {
             getSystemService(NotificationManager::class.java).canUseFullScreenIntent()

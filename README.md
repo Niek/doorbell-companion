@@ -60,7 +60,7 @@ If you already use a build with an earlier app ID, disconnect it from Home Assis
 1. Open **Doorbell Companion** on Wi-Fi and select your discovered instance, or enter its URL manually.
 2. Sign in through your browser. Doorbell Companion discovers your doorbells and creates the Home Assistant automation.
 3. On Android, grant **Notifications** and **Full-screen lockscreen calls** when prompted. On either platform, grant **Microphone** if you want to use talkback with a compatible camera.
-4. Tap **Test call** to check video and audio. To check the full push path, tap **Test HA push (3s delay)** and lock your phone.
+4. Tap **Test call** to check video and audio. To check the full push path, tap **Test push** and lock your phone within 3 seconds.
 
 ## Self-host the push relay
 

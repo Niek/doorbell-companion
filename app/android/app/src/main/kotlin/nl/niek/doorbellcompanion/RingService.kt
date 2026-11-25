@@ -124,7 +124,8 @@ object RingNotification {
         val answer = PendingIntent.getActivity(context, 1, Intent(intent).putExtra("answer", true), flags, options)
         val decline = PendingIntent.getBroadcast(context, 2, Intent(context, DeclineReceiver::class.java), flags)
         val builder = Notification.Builder(context, if (looping) LOOP_CHANNEL else CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_stat_doorbell)
+            .setColor(0xFF2F6BFF.toInt())
             .setContentTitle("$doorbellName ringing")
             .setContentText("Someone is at the door")
             .setCategory(Notification.CATEGORY_CALL)
@@ -137,8 +138,8 @@ object RingNotification {
             val caller = Person.Builder().setName(doorbellName).setImportant(true).build()
             builder.setStyle(Notification.CallStyle.forIncomingCall(caller, decline, answer))
         } else {
-            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Decline", decline)
-            builder.addAction(android.R.drawable.ic_menu_call, "Answer", answer)
+            builder.addAction(R.drawable.ic_call_end, "Decline", decline)
+            builder.addAction(R.drawable.ic_call, "Answer", answer)
         }
         return builder.build()
     }

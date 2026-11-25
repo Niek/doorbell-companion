@@ -18,7 +18,9 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
-import android.widget.Button
+import android.content.res.ColorStateList
+import android.graphics.Typeface
+import android.graphics.drawable.RippleDrawable
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -30,9 +32,9 @@ import org.webrtc.VideoTrack
 class CallActivity : Activity() {
     private lateinit var title: TextView
     private lateinit var subtitle: TextView
-    private lateinit var answer: Button
-    private lateinit var muteBtn: Button
-    private lateinit var dismiss: Button
+    private lateinit var answer: CallButton
+    private lateinit var muteBtn: CallButton
+    private lateinit var dismiss: CallButton
     private lateinit var remoteVideo: SurfaceViewRenderer
     private lateinit var snapshotView: ImageView
 
@@ -50,19 +52,61 @@ class CallActivity : Activity() {
 
     private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 
-    private fun pillButton(label: String, colorHex: String, horizontalDp: Int = 24, onClick: () -> Unit): Button =
-        Button(this).apply {
-            text = label
-            textSize = 15f
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = 999f
-                setColor(Color.parseColor(colorHex))
-            }
-            setPadding(horizontalDp.dp(), 12.dp(), horizontalDp.dp(), 12.dp())
+    /** A round icon button with a caption underneath, styled like the system call screen. */
+    private inner class CallButton(iconRes: Int, label: String, color: Int, onClick: () -> Unit) {
+        private val icon = ImageView(this@CallActivity).apply {
+            setImageResource(iconRes)
+            imageTintList = ColorStateList.valueOf(Color.WHITE)
+            scaleType = ImageView.ScaleType.CENTER
+            background = RippleDrawable(
+                ColorStateList.valueOf(Color.argb(70, 255, 255, 255)),
+                GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(color)
+                },
+                null,
+            )
+            contentDescription = label
+            isClickable = true
             setOnClickListener { onClick() }
         }
+        private val caption = TextView(this@CallActivity).apply {
+            text = label
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setShadowLayer(6f, 0f, 1f, Color.argb(160, 0, 0, 0))
+        }
+        val view = LinearLayout(this@CallActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(icon, LinearLayout.LayoutParams(72.dp(), 72.dp()))
+            addView(
+                caption,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                    .apply { topMargin = 8.dp() }
+            )
+        }
+        var visibility: Int
+            get() = view.visibility
+            set(value) { view.visibility = value }
+
+        fun update(iconRes: Int, label: String) {
+            icon.setImageResource(iconRes)
+            icon.contentDescription = label
+            caption.text = label
+        }
+    }
+
+    private val liveDot = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setSize(8, 8)
+    }
+
+    private fun setStatus(text: String, live: Boolean = false) {
+        subtitle.text = text
+        liveDot.setColor(if (live) Color.parseColor("#34C759") else Color.parseColor("#FFB627"))
+    }
 
     private fun applyScalingMode() {
         val videoScale = if (fillScreen) {
@@ -136,17 +180,21 @@ class CallActivity : Activity() {
         }
 
         title = TextView(this).apply {
-            text = "$doorbellName ringing"
-            textSize = 26f
+            text = doorbellName
+            textSize = 28f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             setTextColor(Color.WHITE)
             setShadowLayer(8f, 0f, 2f, Color.argb(180, 0, 0, 0))
             gravity = Gravity.CENTER
+            maxLines = 2
         }
         subtitle = TextView(this).apply {
-            text = "Connecting camera…"
             textSize = 14f
             setTextColor(Color.parseColor("#E6EDF5"))
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_VERTICAL
+            liveDot.setSize(8.dp(), 8.dp())
+            setCompoundDrawablesRelativeWithIntrinsicBounds(liveDot, null, null, null)
+            compoundDrawablePadding = 8.dp()
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 999f
@@ -154,6 +202,7 @@ class CallActivity : Activity() {
             }
             setPadding(14.dp(), 6.dp(), 14.dp(), 6.dp())
         }
+        setStatus("Connecting camera…")
 
         val topOverlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -172,26 +221,25 @@ class CallActivity : Activity() {
             )
         }
 
-        answer = pillButton("Answer", "#1E8E3E") { answerCall() }
-        muteBtn = pillButton("Mute mic", "#2C323D", horizontalDp = 18) { toggleMute() }.apply {
-            visibility = View.GONE
-        }
-        dismiss = pillButton("Decline", "#D93025") {
+        dismiss = CallButton(R.drawable.ic_call_end, "Decline", Color.parseColor("#E5383B")) {
             HomeAssistantPrewarm.cancel()
             RingNotification.stop(this@CallActivity)
             finish()
         }
+        muteBtn = CallButton(R.drawable.ic_mic, "Mute", Color.argb(110, 255, 255, 255)) { toggleMute() }.apply {
+            visibility = View.GONE
+        }
+        answer = CallButton(R.drawable.ic_call, "Answer", Color.parseColor("#2DB84D")) { answerCall() }
 
-        fun wrapParams(marginEndDp: Int = 0) =
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                .apply { marginEnd = marginEndDp.dp() }
+        // Equal-weight slots keep Decline on the left and Answer on the right, like the system dialer.
+        fun slot() = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
 
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            addView(answer, wrapParams(12))
-            addView(muteBtn, wrapParams(12))
-            addView(dismiss, wrapParams())
+            addView(dismiss.view, slot())
+            addView(muteBtn.view, slot())
+            addView(answer.view, slot())
         }
 
         val bottomOverlay = FrameLayout(this).apply {
@@ -253,10 +301,10 @@ class CallActivity : Activity() {
         if (intent.getBooleanExtra("answer", false)) {
             answerCall()
         } else {
-            title.text = "$doorbellName ringing"
+            title.text = doorbellName
             answer.visibility = View.VISIBLE
             muteBtn.visibility = View.GONE
-            dismiss.text = "Decline"
+            dismiss.update(R.drawable.ic_call_end, "Decline")
             answered = false
             releaseWebRtcView()
             startHomeAssistantCamera(intent.getStringExtra("camera_entity_id"))
@@ -279,7 +327,7 @@ class CallActivity : Activity() {
 
     private fun startHomeAssistantCamera(intentCameraId: String?) {
         if (!HomeAssistantAuth.isConfigured(this)) {
-            subtitle.text = "Connect Home Assistant first"
+            setStatus("Connect Home Assistant first")
             return
         }
         val prefs = HomeAssistantAuth.prefs(this)
@@ -287,7 +335,7 @@ class CallActivity : Activity() {
             ?: prefs.getString("last_ha_camera", null)?.takeIf { it.isNotBlank() }
             ?: HomeAssistantAuth.resolveCameraForPush(this, emptyMap()).first
         if (entityId == null) {
-            subtitle.text = "No doorbell camera selected in Home Assistant"
+            setStatus("No doorbell camera selected in Home Assistant")
             return
         }
         activeCameraEntityId = entityId
@@ -307,9 +355,7 @@ class CallActivity : Activity() {
                         firstFrameRendered = true
                         snapshotView.visibility = View.GONE
                         snapshotView.setImageDrawable(null)
-                        if (!answered) {
-                            subtitle.text = String.format("Live video • %.1fs", ms / 1000.0)
-                        }
+                        setStatus(String.format("Live · %.1f s", ms / 1000.0), live = true)
                     }
                 }
             }
@@ -327,16 +373,18 @@ class CallActivity : Activity() {
                         remoteTrack?.removeSink(remoteVideo)
                         remoteTrack = track
                         track.addSink(remoteVideo)
-                        if (!answered && !firstFrameRendered && snapshotView.visibility != View.VISIBLE) {
-                            subtitle.text = "Live video"
+                        if (!firstFrameRendered && snapshotView.visibility != View.VISIBLE) {
+                            setStatus("Starting live video…")
                         }
                     }
                 }
             },
             statusListener = { message ->
                 runOnUiThread {
-                    if (!isDestroyed && ((remoteTrack == null && snapshotView.visibility != View.VISIBLE) || answered)) {
-                        subtitle.text = message
+                    val connected = message.startsWith("Connected")
+                    // Before answering, keep the "Live" label once video is up; still surface errors.
+                    if (!isDestroyed && (!firstFrameRendered || answered || !connected)) {
+                        setStatus(message, live = connected)
                     }
                 }
             },
@@ -354,9 +402,8 @@ class CallActivity : Activity() {
                         timing?.mark("snapshot_rendered")
                         snapshotView.setImageBitmap(bitmap)
                         snapshotView.visibility = View.VISIBLE
-                        if (!answered) {
-                            subtitle.text = String.format("Snapshot • %.1fs (connecting video…)", ms / 1000.0)
-                        }
+                        Log.i("DoorbellCompanion", "HA snapshot after $ms ms")
+                        setStatus("Connecting live video…")
                     }
                 }
             }
@@ -376,7 +423,7 @@ class CallActivity : Activity() {
         val remote = haRemote ?: return
         val next = !remote.isMicMuted()
         remote.setMicMuted(next)
-        muteBtn.text = if (next) "Unmute mic" else "Mute mic"
+        muteBtn.update(if (next) R.drawable.ic_mic_off else R.drawable.ic_mic, if (next) "Unmute" else "Mute")
     }
 
     private fun answerCall() {
@@ -415,7 +462,7 @@ class CallActivity : Activity() {
         title.text = doorbellName
         answer.visibility = View.GONE
         muteBtn.visibility = if (haRemote?.isMicAttached() == true) View.VISIBLE else View.GONE
-        dismiss.text = "Hang up"
+        dismiss.update(R.drawable.ic_call_end, "Hang up")
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
