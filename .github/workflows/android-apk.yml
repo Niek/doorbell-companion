@@ -32,7 +32,7 @@ jobs:
           cache: true
 
       - name: Install the NDK used by Flutter
-        run: sdkmanager "ndk;28.2.13676358"
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"'
 
       - name: Resolve dependencies
         run: flutter pub get
