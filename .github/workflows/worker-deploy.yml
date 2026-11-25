@@ -1,0 +1,29 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: doorbell-companion-worker-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy doorbell-companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Deploy to Cloudflare
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKER_DEPLOY_TOKEN }}
+        run: npx --yes wrangler@4.168.0 deploy --keep-vars --message "GitHub ${GITHUB_SHA}"
