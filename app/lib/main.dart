@@ -48,6 +48,8 @@ class AppStatus {
     this.notificationsGranted = true,
     this.microphoneGranted = false,
     this.fullScreenGranted = true,
+    this.pushReady,
+    this.pushError,
   });
 
   final bool haConnected;
@@ -57,6 +59,8 @@ class AppStatus {
   final bool notificationsGranted;
   final bool microphoneGranted;
   final bool fullScreenGranted;
+  final bool? pushReady;
+  final String? pushError;
 
   int get enabledCount => doorbells.where((d) => d.enabled).length;
 
@@ -73,6 +77,8 @@ class AppStatus {
       notificationsGranted: map['notificationsGranted'] != false,
       microphoneGranted: map['microphoneGranted'] == true,
       fullScreenGranted: map['fullScreenGranted'] != false,
+      pushReady: map['pushReady'] as bool?,
+      pushError: map['pushError'] as String?,
     );
   }
 }
@@ -203,7 +209,14 @@ class ProtectFastController extends ChangeNotifier {
   }
 
   Future<void> testCall() => _channel.invokeMethod('testCall');
-  Future<void> testRemotePush() => _channel.invokeMethod('testRemotePush');
+  Future<String?> testRemotePush() async {
+    try {
+      await _channel.invokeMethod('testRemotePush');
+      return null;
+    } on PlatformException catch (e) {
+      return e.message ?? 'Could not send the test call';
+    }
+  }
   Future<void> openUrl(String url) => _channel.invokeMethod('openUrl', {'url': url});
   Future<void> requestPermission(String type) =>
       _channel.invokeMethod('requestPermissions', {'type': type});
@@ -559,6 +572,18 @@ class _ConnectedBody extends StatelessWidget {
             ),
           ),
         ],
+        if (st.pushReady == false) ...[
+          const SizedBox(height: 16),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.phone_outlined),
+              title: const Text('iPhone call registration pending'),
+              subtitle: Text(
+                st.pushError ?? 'Waiting for Apple push registration.',
+              ),
+            ),
+          ),
+        ],
         const SizedBox(height: 24),
         _SectionHeader(
           st.firstCameraName.isNotEmpty ? 'Diagnostics (${st.firstCameraName})' : 'Diagnostics',
@@ -571,15 +596,20 @@ class _ConnectedBody extends StatelessWidget {
         ),
         const SizedBox(height: 10),
         OutlinedButton.icon(
-          onPressed: st.doorbells.isNotEmpty
-              ? () {
-                  controller.testRemotePush();
+          onPressed: st.doorbells.isNotEmpty && st.pushReady != false
+              ? () async {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
                       content: Text('Sending push via Home Assistant in 3s — lock your screen!'),
                       duration: Duration(seconds: 3),
                     ),
                   );
+                  final error = await controller.testRemotePush();
+                  if (error != null && context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(error)),
+                    );
+                  }
                 }
               : null,
           icon: const Icon(Icons.notifications_active_outlined),
@@ -699,18 +729,20 @@ class SettingsScreen extends StatelessWidget {
               const _SectionHeader('Permissions', padding: EdgeInsets.fromLTRB(8, 0, 8, 8)),
               _DividedCard(
                 children: [
-                  _PermissionTile(
-                    icon: Icons.notifications_outlined,
-                    title: 'Notifications',
-                    granted: st.notificationsGranted,
-                    onTap: () => controller.requestPermission('notifications'),
-                  ),
-                  _PermissionTile(
-                    icon: Icons.fullscreen,
-                    title: 'Full-screen lockscreen calls',
-                    granted: st.fullScreenGranted,
-                    onTap: () => controller.requestPermission('fullScreen'),
-                  ),
+                  if (st.pushReady == null) ...[
+                    _PermissionTile(
+                      icon: Icons.notifications_outlined,
+                      title: 'Notifications',
+                      granted: st.notificationsGranted,
+                      onTap: () => controller.requestPermission('notifications'),
+                    ),
+                    _PermissionTile(
+                      icon: Icons.fullscreen,
+                      title: 'Full-screen lockscreen calls',
+                      granted: st.fullScreenGranted,
+                      onTap: () => controller.requestPermission('fullScreen'),
+                    ),
+                  ],
                   _PermissionTile(
                     icon: Icons.mic_none_outlined,
                     title: 'Microphone (two-way audio)',

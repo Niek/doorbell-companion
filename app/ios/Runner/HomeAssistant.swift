@@ -1,0 +1,538 @@
+import Foundation
+import Security
+
+typealias JSON = [String: Any]
+
+struct ProtectFastError: LocalizedError {
+  var errorDescription: String?
+  init(_ message: String) { errorDescription = message }
+}
+
+struct HAHTTPError: LocalizedError {
+  let status: Int
+  let path: String
+  var errorDescription: String? { "Home Assistant returned HTTP \(status) for \(path)" }
+}
+
+struct Doorbell: Codable {
+  let camera: String
+  let name: String
+  let triggers: [String]
+  var talkback = false
+  var enabled = true
+
+  var flutterValue: JSON { ["cameraEntityId": camera, "name": name, "enabled": enabled] }
+}
+
+struct HACredentials: Codable {
+  let url: URL
+  let clientID: String
+  let refreshToken: String
+  var accessToken: String
+  var expiration: Date
+}
+
+@MainActor
+final class HomeAssistant {
+  static let callback = "protect-fast://auth-callback"
+  static let relayURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "ProtectFastRelayURL") as? String ?? "")!
+  static var clientID: String { relayURL.appendingPathComponent("ios").absoluteString }
+
+  private let defaults = UserDefaults.standard
+  private let session: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 8
+    configuration.timeoutIntervalForResource = 15
+    return URLSession(configuration: configuration)
+  }()
+  private let webSockets = URLSession(configuration: .ephemeral)
+  private var refreshTask: Task<String, Error>?
+  private var credentials: HACredentials?
+  private(set) var doorbells: [Doorbell]
+  private(set) var localURL: URL?
+  private(set) var externalURL: URL?
+  private var deviceRegistration: String?
+  private var registeredPushToken: String?
+  private var registrationServer: URL?
+  private let deviceID: String
+
+  var url: URL? { credentials?.url }
+  var endpoints: [URL] {
+    var urls = [localURL, externalURL, url].compactMap { $0 }
+    var seen = Set<URL>()
+    urls.removeAll { !seen.insert($0).inserted }
+    return urls
+  }
+  var name: String { "Protect Fast iOS \(deviceID)" }
+  var automationID: String { "protect_fast_ios_\(deviceID)" }
+  private var notifyService: String { "mobile_app_\(automationID)" }
+
+  init() {
+    credentials = Self.loadCredentials()
+    deviceID = defaults.string(forKey: "device_id") ?? String(
+      UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)
+    ).lowercased()
+    defaults.set(deviceID, forKey: "device_id")
+    doorbells = defaults.data(forKey: "doorbells").flatMap {
+      try? JSONDecoder().decode([Doorbell].self, from: $0)
+    } ?? []
+    localURL = defaults.url(forKey: "local_url")
+    externalURL = defaults.url(forKey: "external_url")
+    deviceRegistration = defaults.string(forKey: "registration")
+    registeredPushToken = defaults.string(forKey: "registered_push_token")
+    registrationServer = defaults.url(forKey: "registration_server")
+  }
+
+  static func serverURL(_ raw: String) throws -> URL {
+    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    var components = URLComponents(string: value.contains("://") ? value : "https://\(value)")
+    guard let scheme = components?.scheme?.lowercased(), ["http", "https"].contains(scheme),
+          let host = components?.host, !host.isEmpty,
+          components?.user == nil, components?.password == nil,
+          components?.query == nil, components?.fragment == nil else {
+      throw ProtectFastError("Enter a valid Home Assistant URL")
+    }
+    while components?.path.hasSuffix("/") == true { components?.path.removeLast() }
+    guard let url = components?.url else { throw ProtectFastError("Invalid Home Assistant URL") }
+    return url
+  }
+
+  func signIn(at url: URL, with code: String, verifier: String) async throws {
+    let response = try await tokenResponse(url: url, fields: [
+      "grant_type": "authorization_code", "code": code, "client_id": Self.clientID,
+      "code_verifier": verifier,
+    ])
+    guard let access = response["access_token"] as? String,
+          let refresh = response["refresh_token"] as? String else {
+      throw ProtectFastError("Home Assistant did not return sign-in credentials")
+    }
+    let value = HACredentials(
+      url: url, clientID: Self.clientID, refreshToken: refresh, accessToken: access,
+      expiration: Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
+    )
+    try Self.saveCredentials(value)
+    credentials = value
+    if registrationServer != url {
+      deviceRegistration = nil
+      registeredPushToken = nil
+      defaults.removeObject(forKey: "registration")
+      defaults.removeObject(forKey: "registered_push_token")
+    }
+  }
+
+  func accessToken(forceRefresh: Bool = false) async throws -> String {
+    if let refreshTask { return try await refreshTask.value }
+    guard let credentials else { throw ProtectFastError("Sign in to Home Assistant first") }
+    if !forceRefresh && credentials.expiration.timeIntervalSinceNow > 30 {
+      return credentials.accessToken
+    }
+    let task = Task {
+      var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+      for endpoint in endpoints {
+        do {
+          let response = try await tokenResponse(url: endpoint, fields: [
+            "grant_type": "refresh_token", "refresh_token": credentials.refreshToken,
+            "client_id": credentials.clientID,
+          ])
+          guard let access = response["access_token"] as? String else {
+            throw ProtectFastError("Home Assistant did not refresh sign-in credentials")
+          }
+          try Task.checkCancellation()
+          var updated = credentials
+          updated.accessToken = access
+          updated.expiration = Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
+          try Self.saveCredentials(updated)
+          self.credentials = updated
+          return access
+        } catch {
+          try Task.checkCancellation()
+          lastError = error
+        }
+      }
+      throw lastError
+    }
+    refreshTask = task
+    defer { refreshTask = nil }
+    return try await task.value
+  }
+
+  func authorizedSocket(at endpoint: URL, token: String) async throws -> HASocket {
+    let socket = HASocket(baseURL: endpoint, session: webSockets)
+    do {
+      guard try await socket.receive()["type"] as? String == "auth_required" else {
+        throw ProtectFastError("Unexpected Home Assistant WebSocket response")
+      }
+      try await socket.send(["type": "auth", "access_token": token])
+      guard try await socket.receive()["type"] as? String == "auth_ok" else {
+        throw ProtectFastError("Home Assistant rejected the camera session")
+      }
+      return socket
+    } catch {
+      socket.close()
+      throw error
+    }
+  }
+
+  func refreshDoorbells() async throws {
+    let token = try await accessToken()
+    var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+    for endpoint in endpoints {
+      do {
+        let socket = try await authorizedSocket(at: endpoint, token: token)
+        defer { socket.close() }
+        let devices = try await socket.command("config/device_registry/list") as? [JSON] ?? []
+        let entities = try await socket.command("config/entity_registry/list") as? [JSON] ?? []
+        let states = try await socket.command("get_states") as? [JSON] ?? []
+        let config = try await socket.command("get_config") as? JSON ?? [:]
+        let disabled = Set(doorbells.filter { !$0.enabled }.map(\.camera))
+        var discovered = Self.discoverDoorbells(devices: devices, entities: entities, states: states)
+        for index in discovered.indices {
+          let result = try? await socket.command("camera/capabilities", fields: [
+            "entity_id": discovered[index].camera,
+          ]) as? JSON
+          discovered[index].talkback = result?["two_way_audio"] as? Bool == true
+          discovered[index].enabled = !disabled.contains(discovered[index].camera)
+        }
+        doorbells = discovered
+        saveDoorbells()
+        localURL = (config["internal_url"] as? String).flatMap { try? Self.serverURL($0) } ?? localURL
+        externalURL = (config["external_url"] as? String).flatMap { try? Self.serverURL($0) }
+        defaults.set(localURL, forKey: "local_url")
+        defaults.set(externalURL, forKey: "external_url")
+        return
+      } catch {
+        try Task.checkCancellation()
+        lastError = error
+      }
+    }
+    throw lastError
+  }
+
+  static func discoverDoorbells(devices: [JSON], entities: [JSON], states: [JSON]) -> [Doorbell] {
+    var names: [String: String] = [:]
+    for device in devices {
+      guard let id = device["id"] as? String else { continue }
+      names[id] = device["name_by_user"] as? String ?? device["name"] as? String
+    }
+    var friendlyNames: [String: String] = [:]
+    for state in states {
+      guard let id = state["entity_id"] as? String else { continue }
+      friendlyNames[id] = (state["attributes"] as? JSON)?["friendly_name"] as? String
+    }
+    var cameras: [String: [JSON]] = [:]
+    var standalone: [JSON] = []
+    var rings: [String: [String]] = [:]
+    for entity in entities {
+      guard entity["disabled_by"] == nil || entity["disabled_by"] is NSNull,
+            let id = entity["entity_id"] as? String else { continue }
+      let device = entity["device_id"] as? String
+      if id.hasPrefix("camera.") {
+        if let device { cameras[device, default: []].append(entity) }
+        else { standalone.append(entity) }
+      } else if let device, id.hasPrefix("binary_sensor.") || id.hasPrefix("event.") {
+        let classes = ["translation_key", "original_device_class", "device_class"]
+        if classes.contains(where: { entity[$0] as? String == "doorbell" })
+            || id.hasSuffix("_doorbell") {
+          rings[device, default: []].append(id)
+        }
+      }
+    }
+    var result: [Doorbell] = []
+    for (device, triggers) in rings {
+      guard let best = cameras[device]?.min(by: { cameraRank($0) < cameraRank($1) }),
+            let camera = best["entity_id"] as? String else { continue }
+      let binary = triggers.filter { $0.hasPrefix("binary_sensor.") }
+      result.append(Doorbell(camera: camera, name: names[device] ?? friendlyNames[camera] ?? camera,
+                             triggers: binary.isEmpty ? triggers : binary))
+    }
+    if result.isEmpty {
+      result = (cameras.values.flatMap { $0 } + standalone).compactMap { entity in
+        guard let camera = entity["entity_id"] as? String else { return nil }
+        return Doorbell(camera: camera, name: friendlyNames[camera] ?? camera, triggers: [])
+      }
+    }
+    return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+  }
+
+  private static func cameraRank(_ entity: JSON) -> Int {
+    let id = entity["entity_id"] as? String ?? ""
+    let unique = entity["unique_id"] as? String ?? ""
+    if unique.hasSuffix("_1") || id.contains("medium") { return 0 }
+    if unique.hasSuffix("_0") { return 1 }
+    if id.contains("package") || unique.hasSuffix("_3") { return 3 }
+    return 2
+  }
+
+  func selectedDoorbell(camera: String? = nil) -> Doorbell? {
+    if let camera, !camera.isEmpty { return doorbells.first { $0.camera == camera } }
+    return doorbells.first { $0.enabled }
+  }
+
+  func setEnabled(_ camera: String, _ enabled: Bool) {
+    if let index = doorbells.firstIndex(where: { $0.camera == camera }) {
+      doorbells[index].enabled = enabled
+      saveDoorbells()
+    }
+  }
+
+  func setupPush(token pushToken: String, force: Bool = false) async throws {
+    guard url != nil else { return }
+    let enabled = doorbells.filter { $0.enabled && !$0.triggers.isEmpty }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    let automationState = try encoder.encode(enabled)
+    if !force, deviceRegistration != nil, registeredPushToken == pushToken,
+       defaults.data(forKey: "synced_automation") == automationState {
+      return
+    }
+    let token = try await accessToken()
+    let endpoint = try await reachableEndpoint(token: token)
+    let pushURL = Self.relayURL.appendingPathComponent("push/ios").absoluteString
+    let appData = ["push_url": pushURL, "push_token": pushToken]
+    let deviceInfo: JSON = [
+      "device_name": name, "manufacturer": "Apple", "model": "iOS",
+      "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "1.0",
+      "os_version": ProcessInfo.processInfo.operatingSystemVersionString, "app_data": appData,
+    ]
+    if let registration = deviceRegistration, registeredPushToken != pushToken {
+      do {
+        _ = try await request(at: endpoint, path: "api/webhook/\(registration)", json: [
+          "type": "update_registration", "data": deviceInfo,
+        ])
+      } catch let error as HAHTTPError where error.status == 404 || error.status == 410 {
+        deviceRegistration = nil
+      }
+    }
+    if deviceRegistration == nil {
+      let appID = Bundle.main.bundleIdentifier ?? "nl.niek.protect-fast"
+      let response = try await request(at: endpoint, path: "api/mobile_app/registrations",
+                                       token: token, json: deviceInfo.merging([
+        "device_id": deviceID, "app_id": appID, "app_name": "Protect Fast",
+        "os_name": "iOS", "supports_encryption": false,
+      ]) { _, new in new })
+      guard let object = try JSONSerialization.jsonObject(with: response) as? JSON,
+            let webhook = object["webhook_id"] as? String else {
+        throw ProtectFastError("Home Assistant did not register this iPhone")
+      }
+      deviceRegistration = webhook
+      registrationServer = url
+      defaults.set(webhook, forKey: "registration")
+      defaults.set(url, forKey: "registration_server")
+    }
+    registeredPushToken = pushToken
+    defaults.set(pushToken, forKey: "registered_push_token")
+
+    let path = "api/config/automation/config/\(automationID)"
+    if enabled.isEmpty {
+      _ = try await request(at: endpoint, path: path, token: token, method: "DELETE", allowMissing: true)
+      defaults.set(automationState, forKey: "synced_automation")
+      return
+    }
+
+    var triggers: [JSON] = []
+    var branches: [JSON] = []
+    for (index, bell) in enabled.enumerated() {
+      let triggerID = "doorbell_\(index)"
+      for entity in bell.triggers {
+        var trigger: JSON = ["trigger": "state", "entity_id": entity, "id": triggerID]
+        if entity.hasPrefix("binary_sensor.") {
+          trigger["to"] = "on"
+        } else {
+          trigger["not_from"] = ["unknown", "unavailable"]
+          trigger["not_to"] = ["unknown", "unavailable"]
+        }
+        triggers.append(trigger)
+      }
+      branches.append([
+        "conditions": [["condition": "trigger", "id": triggerID]],
+        "sequence": [["action": "notify.\(notifyService)", "data": pushPayload(for: bell)]],
+      ])
+    }
+    _ = try await request(at: endpoint, path: path, token: token, json: [
+      "id": automationID, "alias": "Protect Fast: Doorbell Call (\(name))",
+      "mode": "parallel", "triggers": triggers, "conditions": [], "actions": [["choose": branches]],
+    ])
+    defaults.set(automationState, forKey: "synced_automation")
+  }
+
+  func testPush(bell: Doorbell) async throws {
+    let token = try await accessToken()
+    let endpoint = try await reachableEndpoint(token: token)
+    var payload = pushPayload(for: bell)
+    var data = payload["data"] as? JSON ?? [:]
+    data["event_ms"] = String(Int(Date().timeIntervalSince1970 * 1000))
+    payload["data"] = data
+    _ = try await request(at: endpoint, path: "api/services/notify/\(notifyService)",
+                          token: token, json: payload)
+  }
+
+  private func pushPayload(for bell: Doorbell) -> JSON {
+    ["title": bell.name, "message": "Someone is at the door", "data": [
+      "type": "doorbell_ring", "camera_entity_id": bell.camera, "doorbell_name": bell.name,
+    ]]
+  }
+
+  func disconnect() async throws {
+    if url != nil, deviceRegistration != nil {
+      let token = try await accessToken()
+      let endpoint = try await reachableEndpoint(token: token)
+      _ = try await request(at: endpoint, path: "api/config/automation/config/\(automationID)",
+                            token: token, method: "DELETE", allowMissing: true)
+    }
+    refreshTask?.cancel()
+    credentials = nil
+    SecItemDelete(Self.keychainQuery as CFDictionary)
+    doorbells = []
+    localURL = nil
+    externalURL = nil
+    // Keep the existing HA registration for a reconnect to the same server.
+    for key in ["doorbells", "local_url", "external_url", "synced_automation"] {
+      defaults.removeObject(forKey: key)
+    }
+  }
+
+  private func reachableEndpoint(token: String) async throws -> URL {
+    var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+    for endpoint in [url, localURL, externalURL].compactMap({ $0 }) {
+      do {
+        _ = try await request(at: endpoint, path: "api/", token: token)
+        return endpoint
+      } catch {
+        try Task.checkCancellation()
+        lastError = error
+      }
+    }
+    throw lastError
+  }
+
+  func snapshot(at endpoint: URL, camera: String, token: String) async throws -> Data {
+    try await request(at: endpoint, path: "api/camera_proxy/\(camera)", token: token)
+  }
+
+  private func saveDoorbells() {
+    defaults.set(try? JSONEncoder().encode(doorbells), forKey: "doorbells")
+  }
+
+  private func request(at url: URL, path: String, token: String? = nil, json: JSON? = nil,
+                       method: String? = nil, allowMissing: Bool = false) async throws -> Data {
+    var request = URLRequest(url: url.appendingPathComponent(path), timeoutInterval: 8)
+    request.httpMethod = method ?? (json == nil ? "GET" : "POST")
+    if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    if let json {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try JSONSerialization.data(withJSONObject: json)
+    }
+    let (data, response) = try await session.data(for: request)
+    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+    guard (200..<300).contains(status) || (allowMissing && status == 404) else {
+      // Webhook IDs are credentials. Avoid including the request URL in an error.
+      throw HAHTTPError(status: status, path: path.hasPrefix("api/webhook/") ? "registration" : path)
+    }
+    return data
+  }
+
+  private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
+    var request = URLRequest(url: url.appendingPathComponent("auth/token"), timeoutInterval: 8)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+    request.httpBody = Data(fields.map { key, value in
+      "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")"
+    }.joined(separator: "&").utf8)
+    let (data, response) = try await session.data(for: request)
+    guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
+          let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
+      throw ProtectFastError("Home Assistant sign-in failed")
+    }
+    return result
+  }
+
+  private static let keychainQuery: [String: Any] = [
+    kSecClass as String: kSecClassGenericPassword,
+    kSecAttrService as String: "nl.niek.protect-fast.home-assistant",
+    kSecAttrAccount as String: "oauth",
+  ]
+
+  private static func loadCredentials() -> HACredentials? {
+    var query = keychainQuery
+    query[kSecReturnData as String] = true
+    var item: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+          let data = item as? Data else { return nil }
+    return try? JSONDecoder().decode(HACredentials.self, from: data)
+  }
+
+  private static func saveCredentials(_ credentials: HACredentials) throws {
+    let data = try JSONEncoder().encode(credentials)
+    let attributes: [String: Any] = [
+      kSecValueData as String: data,
+      kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+    ]
+    var status = SecItemUpdate(keychainQuery as CFDictionary, attributes as CFDictionary)
+    if status == errSecItemNotFound {
+      status = SecItemAdd(keychainQuery.merging(attributes) { _, new in new } as CFDictionary, nil)
+    }
+    guard status == errSecSuccess else { throw ProtectFastError("Could not save Home Assistant sign-in") }
+  }
+}
+
+@MainActor
+final class HASocket {
+  private let task: URLSessionWebSocketTask
+  private var nextID = 0
+
+  init(baseURL: URL, session: URLSession) {
+    var components = URLComponents(url: baseURL.appendingPathComponent("api/websocket"),
+                                   resolvingAgainstBaseURL: false)!
+    components.scheme = baseURL.scheme == "http" ? "ws" : "wss"
+    task = session.webSocketTask(with: URLRequest(url: components.url!, timeoutInterval: 8))
+    task.resume()
+  }
+
+  func close() { task.cancel(with: .goingAway, reason: nil) }
+
+  func send(_ object: JSON) async throws {
+    let data = try JSONSerialization.data(withJSONObject: object)
+    try await task.send(.string(String(decoding: data, as: UTF8.self)))
+  }
+
+  func receive() async throws -> JSON {
+    try await withTaskCancellationHandler {
+      let data: Data
+      switch try await task.receive() {
+      case .string(let value): data = Data(value.utf8)
+      case .data(let value): data = value
+      @unknown default: throw ProtectFastError("Unknown Home Assistant WebSocket response")
+      }
+      guard let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
+        throw ProtectFastError("Invalid Home Assistant WebSocket response")
+      }
+      return result
+    } onCancel: {
+      task.cancel(with: .goingAway, reason: nil)
+    }
+  }
+
+  func command(_ type: String, fields: JSON = [:]) async throws -> Any? {
+    let id = try await sendCommand(type, fields: fields)
+    while !Task.isCancelled {
+      let message = try await receive()
+      guard message["type"] as? String == "result", message["id"] as? Int == id else { continue }
+      guard message["success"] as? Bool == true else {
+        throw ProtectFastError("Home Assistant rejected \(type)")
+      }
+      return message["result"]
+    }
+    throw CancellationError()
+  }
+
+  func sendCommand(_ type: String, fields: JSON) async throws -> Int {
+    nextID += 1
+    let id = nextID
+    var message = fields
+    message["type"] = type
+    message["id"] = id
+    try await send(message)
+    return id
+  }
+}
