@@ -7,9 +7,9 @@
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:28857984978:android:37ec537b8072e32338ca0b",
+        "mobilesdk_app_id": "1:28857984978:android:33c5116bbd12399c38ca0b",
         "android_client_info": {
-          "package_name": "nl.niek.protect_fast"
+          "package_name": "nl.niek.doorbellcompanion"
         }
       },
       "oauth_client": [],

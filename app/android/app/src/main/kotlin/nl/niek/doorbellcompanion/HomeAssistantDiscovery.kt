@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.content.Context
 import android.net.nsd.NsdManager
@@ -40,7 +40,7 @@ class HomeAssistantDiscovery(
         discovered.clear()
         try {
             multicastLock = appContext.getSystemService(WifiManager::class.java)
-                ?.createMulticastLock("protect_fast_ha_mdns")
+                ?.createMulticastLock("doorbell_companion_ha_mdns")
                 ?.apply {
                     setReferenceCounted(false)
                     acquire()
@@ -51,7 +51,7 @@ class HomeAssistantDiscovery(
             override fun onDiscoveryStarted(regType: String) {}
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                Log.w("ProtectFast", "mDNS discovery start failed: $errorCode")
+                Log.w("DoorbellCompanion", "mDNS discovery start failed: $errorCode")
             }
             override fun onDiscoveryStopped(serviceType: String) {}
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
@@ -63,7 +63,7 @@ class HomeAssistantDiscovery(
         try {
             nsd.discoverServices("_home-assistant._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (e: Exception) {
-            Log.w("ProtectFast", "mDNS discoverServices error: ${e.javaClass.simpleName}")
+            Log.w("DoorbellCompanion", "mDNS discoverServices error: ${e.javaClass.simpleName}")
         }
     }
 

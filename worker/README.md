@@ -6,7 +6,7 @@ Home Assistant passes each user's Firebase registration token (`push_token`) dir
 
 ## Android setup
 
-1. Create a Firebase project for `nl.niek.protect_fast`, enable the FCM API, and download a service account JSON key with permission to send FCM messages.
+1. Register the Android app `nl.niek.doorbellcompanion` in your Firebase project and put its `google-services.json` in `app/android/app/`. Enable the FCM API and obtain a service account credential with permission to send FCM messages.
 2. Set the secret and deploy:
 
    ```sh
@@ -14,7 +14,7 @@ Home Assistant passes each user's Firebase registration token (`push_token`) dir
    npx wrangler deploy
    ```
 
-3. Point `PUSH_RELAY_URL` in `app/android/app/src/main/kotlin/nl/niek/protect_fast/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev/push` (or use the hosted default). Signing in to Home Assistant in Doorbell Companion sets up automatic ring notifications.
+3. Point `PUSH_RELAY_URL` in `app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev/push` (or use the hosted default). Signing in to Home Assistant in Doorbell Companion sets up automatic ring notifications.
 
 ## iOS VoIP pushes
 
@@ -25,6 +25,6 @@ npx wrangler secret put APNS_SANDBOX_AUTH < /path/to/apns-sandbox-auth.json
 npx wrangler deploy
 ```
 
-The iOS app registers with Home Assistant against `/push/ios`. The relay sends the PushKit token to Apple using the `<bundle-id>.voip` topic. Keep `APNS_BUNDLE_ID` aligned with the iOS bundle ID if you override the default `nl.niek.protect-fast`. For a self-hosted relay, also point `ProtectFastRelayURL` in the iOS `Info.plist` at the HTTPS origin of your Worker.
+The iOS app registers with Home Assistant against `/push/ios`. The relay sends the PushKit token to Apple using the `<bundle-id>.voip` topic. Keep `APNS_BUNDLE_ID` aligned with the iOS bundle ID if you override the default `nl.niek.doorbellcompanion`. For a self-hosted relay, also point `DoorbellCompanionRelayURL` in the iOS `Info.plist` at the HTTPS origin of your Worker.
 
 Use a deployed Worker when testing APNs delivery. Apple requires HTTP/2, which the local Workers runtime may not negotiate with APNs.

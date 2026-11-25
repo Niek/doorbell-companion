@@ -11,7 +11,7 @@ For installation and setup, see the [project README](../README.md).
 3. **Pre-warmed sub-second WebRTC:** When a high-priority FCM push arrives (`RingService`), Doorbell Companion races local LAN and external Home Assistant WebSockets in parallel with local WebRTC SDP offer generation at `t = 0 ms`—before Android finishes opening `CallActivity` on the lock screen.
 4. **Two-way audio:** Negotiates `SEND_RECV` audio upfront while keeping the microphone track passive during ringing; tapping **Answer** enables hardware echo-cancelled speakerphone and attaches the microphone immediately whenever the camera's SDP answer supports backchannel audio.
 
-For call startup diagnostics, inspect `adb logcat -s ProtectTiming:I`.
+For call startup diagnostics, inspect `adb logcat -s DoorbellTiming:I`.
 
 ## iOS
 

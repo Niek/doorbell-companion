@@ -3,7 +3,7 @@ import 'package:flutter/services.dart';
 
 const _appName = 'Doorbell Companion';
 
-void main() => runApp(const ProtectFastApp());
+void main() => runApp(const DoorbellCompanionApp());
 
 class DoorbellItem {
   const DoorbellItem({
@@ -85,13 +85,13 @@ class AppStatus {
   }
 }
 
-class ProtectFastController extends ChangeNotifier {
-  ProtectFastController() {
+class DoorbellCompanionController extends ChangeNotifier {
+  DoorbellCompanionController() {
     _channel.setMethodCallHandler(_handleNativeCall);
     refreshStatus();
   }
 
-  static const _channel = MethodChannel('protect_fast');
+  static const _channel = MethodChannel('doorbell_companion');
 
   AppStatus status = const AppStatus();
   List<DiscoveredInstance> discovered = const [];
@@ -224,15 +224,15 @@ class ProtectFastController extends ChangeNotifier {
       _channel.invokeMethod('requestPermissions', {'type': type});
 }
 
-class ProtectFastApp extends StatefulWidget {
-  const ProtectFastApp({super.key});
+class DoorbellCompanionApp extends StatefulWidget {
+  const DoorbellCompanionApp({super.key});
 
   @override
-  State<ProtectFastApp> createState() => _ProtectFastAppState();
+  State<DoorbellCompanionApp> createState() => _DoorbellCompanionAppState();
 }
 
-class _ProtectFastAppState extends State<ProtectFastApp> {
-  late final ProtectFastController controller = ProtectFastController();
+class _DoorbellCompanionAppState extends State<DoorbellCompanionApp> {
+  late final DoorbellCompanionController controller = DoorbellCompanionController();
 
   @override
   void dispose() {
@@ -271,7 +271,7 @@ class _ProtectFastAppState extends State<ProtectFastApp> {
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.controller});
 
-  final ProtectFastController controller;
+  final DoorbellCompanionController controller;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -364,7 +364,7 @@ class _OnboardingBody extends StatelessWidget {
     required this.urlController,
   });
 
-  final ProtectFastController controller;
+  final DoorbellCompanionController controller;
   final TextEditingController urlController;
 
   @override
@@ -502,7 +502,7 @@ class _OnboardingBody extends StatelessWidget {
 class _ConnectedBody extends StatelessWidget {
   const _ConnectedBody({required this.controller});
 
-  final ProtectFastController controller;
+  final DoorbellCompanionController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -625,7 +625,7 @@ class _ConnectedBody extends StatelessWidget {
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key, required this.controller});
 
-  final ProtectFastController controller;
+  final DoorbellCompanionController controller;
 
   Future<void> _confirmDisconnect(BuildContext context) async {
     final confirmed = await showDialog<bool>(

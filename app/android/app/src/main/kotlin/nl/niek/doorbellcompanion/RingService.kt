@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.app.ActivityOptions
 import android.app.Notification
@@ -33,7 +33,7 @@ class RingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         if (message.data["type"] != "doorbell_ring") return
         CallTiming.start(message.data["received_at"], message.data["event_ms"])
-        Log.i("ProtectFast", "Doorbell push received")
+        Log.i("DoorbellCompanion", "Doorbell push received")
 
         var doorbellName = message.data["doorbell_name"]?.takeIf { it.isNotBlank() } ?: "Doorbell"
         var camId: String? = null
@@ -94,7 +94,7 @@ object RingNotification {
                     .putExtra("camera_entity_id", cameraEntityId)
             )
         } catch (e: RuntimeException) {
-            Log.w("ProtectFast", "Unable to start ringtone service", e)
+            Log.w("DoorbellCompanion", "Unable to start ringtone service", e)
             context.getSystemService(NotificationManager::class.java)
                 .notify(ID, build(context, false, doorbellName, cameraEntityId))
         }
@@ -183,7 +183,7 @@ class RingtoneService : Service() {
                         prepareAsync()
                     }
                 } catch (e: Exception) {
-                    Log.w("ProtectFast", "Unable to start ringtone: ${e.message}")
+                    Log.w("DoorbellCompanion", "Unable to start ringtone: ${e.message}")
                 }
             }
         }

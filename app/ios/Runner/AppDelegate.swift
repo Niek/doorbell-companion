@@ -31,7 +31,7 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
-    let channel = FlutterMethodChannel(name: "protect_fast",
+    let channel = FlutterMethodChannel(name: "doorbell_companion",
                                        binaryMessenger: engineBridge.applicationRegistrar.messenger())
     self.channel = channel
     channel.setMethodCallHandler { [weak self] call, result in
@@ -69,7 +69,7 @@ import UIKit
           try await home.refreshDoorbells()
           syncPush(force: true)
           await syncTask?.value
-          if let pushSetupError { throw ProtectFastError(pushSetupError) }
+          if let pushSetupError { throw DoorbellCompanionError(pushSetupError) }
           result(status())
         } catch { result(flutterError(error)) }
       }
@@ -95,7 +95,7 @@ import UIKit
       result(nil)
     case "testRemotePush":
       guard calls.pushToken != nil, let bell = home.selectedDoorbell() else {
-        result(flutterError(ProtectFastError("A registered iPhone and an enabled doorbell are required")))
+        result(flutterError(DoorbellCompanionError("A registered iPhone and an enabled doorbell are required")))
         return
       }
       sendTestPush(bell: bell, result: result)
@@ -119,7 +119,7 @@ import UIKit
 
   private func sendTestPush(bell: Doorbell, result: @escaping FlutterResult) {
     guard testPushTask == nil else {
-      result(flutterError(ProtectFastError("A test call is already scheduled")))
+      result(flutterError(DoorbellCompanionError("A test call is already scheduled")))
       return
     }
     let application = UIApplication.shared
@@ -199,7 +199,7 @@ import UIKit
       URLQueryItem(name: "code_challenge", value: challenge),
       URLQueryItem(name: "code_challenge_method", value: "S256"),
     ]
-    let session = ASWebAuthenticationSession(url: authorize.url!, callbackURLScheme: "protect-fast") {
+    let session = ASWebAuthenticationSession(url: authorize.url!, callbackURLScheme: "doorbell-companion") {
       [weak self] callback, error in
       Task { @MainActor in
         guard let self, self.oauthState == state else { return }
@@ -224,7 +224,7 @@ import UIKit
     guard session.start() else {
       authentication = nil
       oauthState = nil
-      throw ProtectFastError("Could not open Home Assistant sign-in")
+      throw DoorbellCompanionError("Could not open Home Assistant sign-in")
     }
   }
 
@@ -264,7 +264,7 @@ import UIKit
   }
 
   private func flutterError(_ error: Error) -> FlutterError {
-    FlutterError(code: "PROTECT_FAST_IOS", message: error.localizedDescription, details: nil)
+    FlutterError(code: "DOORBELL_COMPANION_IOS", message: error.localizedDescription, details: nil)
   }
 }
 

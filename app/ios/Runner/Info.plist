@@ -15,7 +15,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>protect_fast</string>
+	<string>doorbell_companion</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -28,13 +28,13 @@
 	<array>
 		<dict>
 			<key>CFBundleURLSchemes</key>
-			<array><string>protect-fast</string></array>
+			<array><string>doorbell-companion</string></array>
 		</dict>
 	</array>
-	<key>ProtectFastRelayURL</key>
-	<string>https://protect-fast.nivadema.workers.dev</string>
-	<key>ProtectFastAPNSEnvironment</key>
-	<string>$(PROTECT_FAST_APNS_ENVIRONMENT)</string>
+	<key>DoorbellCompanionRelayURL</key>
+	<string>https://doorbell-companion.nivadema.workers.dev</string>
+	<key>DoorbellCompanionAPNSEnvironment</key>
+	<string>$(DOORBELL_COMPANION_APNS_ENVIRONMENT)</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Find and connect to Home Assistant and your doorbell on your local network.</string>
 	<key>NSBonjourServices</key>

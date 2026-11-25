@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.os.SystemClock
 import android.util.Log
@@ -7,7 +7,7 @@ import android.util.Log
 class CallTiming private constructor(private val started: Long, private val id: String) {
     fun mark(stage: String, detail: String = "") {
         val suffix = if (detail.isEmpty()) "" else " $detail"
-        Log.i("ProtectTiming", "id=$id stage=$stage elapsed_ms=${SystemClock.elapsedRealtime() - started} wall_ms=${System.currentTimeMillis()}$suffix")
+        Log.i("DoorbellTiming", "id=$id stage=$stage elapsed_ms=${SystemClock.elapsedRealtime() - started} wall_ms=${System.currentTimeMillis()}$suffix")
     }
 
     companion object {

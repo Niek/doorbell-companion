@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -30,9 +30,9 @@ data class DoorbellInfo(
 )
 
 object HomeAssistantAuth {
-    const val FALLBACK_CLIENT_ID = "https://protect-fast.app"
-    const val PUSH_RELAY_URL = "https://protect-fast.nivadema.workers.dev/push"
-    private const val PREFS = "protect_fast"
+    const val FALLBACK_CLIENT_ID = "https://doorbell-companion.nivadema.workers.dev"
+    const val PUSH_RELAY_URL = "https://doorbell-companion.nivadema.workers.dev/push"
+    private const val PREFS = "doorbell_companion"
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val nonAlnum = Regex("[^a-z0-9]+")
 
@@ -240,7 +240,7 @@ object HomeAssistantAuth {
         return try {
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    Log.w("ProtectFast", "HA token refresh failed: HTTP ${resp.code}")
+                    Log.w("DoorbellCompanion", "HA token refresh failed: HTTP ${resp.code}")
                     return null
                 }
                 val body = JSONObject(resp.body?.string() ?: return null)
@@ -250,7 +250,7 @@ object HomeAssistantAuth {
                 access to expiresAt
             }
         } catch (e: Exception) {
-            Log.w("ProtectFast", "HA token refresh error: ${e.javaClass.simpleName}")
+            Log.w("DoorbellCompanion", "HA token refresh error: ${e.javaClass.simpleName}")
             null
         }
     }
@@ -263,12 +263,12 @@ object HomeAssistantAuth {
         ioExecutor.execute {
             try {
                 val ok = updateRegistration(baseUrl, webhookId, pushUrl, newToken)
-                Log.i("ProtectFast", "Push token sync via webhook: ok=$ok")
+                Log.i("DoorbellCompanion", "Push token sync via webhook: ok=$ok")
                 if (!ok) {
                     setupPushAutomation(context)
                 }
             } catch (e: Exception) {
-                Log.w("ProtectFast", "Push token sync failed: ${e.message}")
+                Log.w("DoorbellCompanion", "Push token sync failed: ${e.message}")
             }
         }
     }
@@ -327,7 +327,7 @@ object HomeAssistantAuth {
                     cachedLlat = llat
                     editor.putString("ha_llat", llat)
                 }
-                Log.i("ProtectFast", "Saved long-lived HA token for zero-RTT call auth")
+                Log.i("DoorbellCompanion", "Saved long-lived HA token for zero-RTT call auth")
             }
         }
         editor.apply()
@@ -592,8 +592,8 @@ object HomeAssistantAuth {
         val updated = !webhookId.isNullOrBlank() && updateRegistration(baseUrl, webhookId, pushUrl, fcmToken)
         if (!updated) {
             val regBody = JSONObject()
-                .put("device_id", "protect_fast_${sanitizeSlug(Build.MODEL)}")
-                .put("app_id", "nl.niek.protect_fast")
+                .put("device_id", "doorbell_companion_${sanitizeSlug(Build.MODEL)}")
+                .put("app_id", "nl.niek.doorbellcompanion")
                 .put("app_name", "Doorbell Companion")
                 .put("app_version", "1.0.0")
                 .put("device_name", devName)
@@ -630,7 +630,7 @@ object HomeAssistantAuth {
         // If the user unchecked all doorbells, remove the HA automation cleanly so no pushes fire
         if (selectedDoorbells.isEmpty()) {
             deleteAutomation(baseUrl, token, autoId)
-            Log.i("ProtectFast", "All doorbells unchecked; removed HA automation $autoId")
+            Log.i("DoorbellCompanion", "All doorbells unchecked; removed HA automation $autoId")
             return notifyService
         }
 
@@ -692,7 +692,7 @@ object HomeAssistantAuth {
         httpClient.newCall(autoReq).execute().use { resp ->
             if (!resp.isSuccessful) error("Could not save HA automation (HTTP ${resp.code})")
         }
-        Log.i("ProtectFast", "HA automation synced (${selectedDoorbells.size} doorbells) -> $notifyService")
+        Log.i("DoorbellCompanion", "HA automation synced (${selectedDoorbells.size} doorbells) -> $notifyService")
         return notifyService
     }
 
@@ -718,7 +718,7 @@ object HomeAssistantAuth {
             .post(payload.toString().toRequestBody(jsonMedia))
             .build()
         httpClient.newCall(req).execute().use { resp ->
-            Log.i("ProtectFast", "Test push via $notifyService -> HTTP ${resp.code}")
+            Log.i("DoorbellCompanion", "Test push via $notifyService -> HTTP ${resp.code}")
             if (!resp.isSuccessful) error("HA notify failed: HTTP ${resp.code}")
         }
     }
@@ -749,7 +749,7 @@ object HomeAssistantAuth {
         return httpClient.newCall(req).execute().use { resp ->
             val body = try { resp.body?.string().orEmpty() } catch (_: Exception) { "" }
             val valid = resp.isSuccessful && body.trim().startsWith("{")
-            Log.i("ProtectFast", "updateRegistration -> HTTP ${resp.code} len=${body.length} valid=$valid")
+            Log.i("DoorbellCompanion", "updateRegistration -> HTTP ${resp.code} len=${body.length} valid=$valid")
             valid
         }
     }
@@ -764,7 +764,7 @@ object HomeAssistantAuth {
                     if (d.optString("domain") != "notify") continue
                     val services = d.optJSONObject("services") ?: continue
                     if (services.has(expectedSlug)) return "notify.$expectedSlug"
-                    val match = services.keys().asSequence().firstOrNull { it.startsWith("mobile_app_protect_fast") }
+                    val match = services.keys().asSequence().firstOrNull { it.startsWith("mobile_app_doorbell_companion") }
                     if (match != null) return "notify.$match"
                 }
                 null
@@ -774,8 +774,7 @@ object HomeAssistantAuth {
         }
 
     private fun sanitizeSlug(raw: String): String = raw.lowercase().replace(nonAlnum, "_").trim('_')
-    // Home Assistant derives the notify service and automation ID from this registration name.
-    private fun deviceName(): String = "Protect Fast ${Build.MODEL}"
+    private fun deviceName(): String = "Doorbell Companion ${Build.MODEL}"
     private fun deviceSlug(): String = "mobile_app_${sanitizeSlug(deviceName())}"
-    private fun automationId(): String = "protect_fast_${sanitizeSlug(deviceName())}"
+    private fun automationId(): String = sanitizeSlug(deviceName())
 }

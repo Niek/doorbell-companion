@@ -49,11 +49,13 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ### iOS
 
 1. Run `flutter pub get` from `app/` and open `app/ios/Runner.xcworkspace` in Xcode.
-2. Select your Apple Developer team for **Runner** and enable Push Notifications for the bundle ID, `nl.niek.protect-fast` by default.
-3. Configure the relay for the APNs environment of your build. Debug uses sandbox and Profile and Release use production by default. Match `PROTECT_FAST_APNS_ENVIRONMENT` to your provisioning profile. [iOS relay setup](worker/README.md#ios-voip-pushes)
+2. Select your Apple Developer team for **Runner** and enable Push Notifications for the bundle ID, `nl.niek.doorbellcompanion` by default.
+3. Configure the relay for the APNs environment of your build. Debug uses sandbox and Profile and Release use production by default. Match `DOORBELL_COMPANION_APNS_ENVIRONMENT` to your provisioning profile. [iOS relay setup](worker/README.md#ios-voip-pushes)
 4. Connect your iPhone and run `flutter run -d <iphone-device-id>` from `app/`.
 
 ## Connect Home Assistant
+
+If you already use a build with an earlier app ID, disconnect it from Home Assistant before setting up the new installation to avoid duplicate rings.
 
 1. Open **Doorbell Companion** on Wi-Fi and select your discovered instance, or enter its URL manually.
 2. Sign in through your browser. Doorbell Companion discovers your doorbells and creates the Home Assistant automation.
@@ -64,14 +66,14 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
 The app defaults to the hosted relay. To run your own Cloudflare Worker, configure the push credentials for the platforms you use. [Worker setup](worker/README.md)
 
-- **Android.** Configure Firebase Cloud Messaging and set `PUSH_RELAY_URL` to your Worker's `/push` endpoint. [Android configuration](app/android/app/src/main/kotlin/nl/niek/protect_fast/HomeAssistantAuth.kt)
-- **iOS.** Configure APNs and set `ProtectFastRelayURL` to your Worker's HTTPS origin. The Worker serves `/ios` for Home Assistant sign-in and `/push/ios` for VoIP notifications. [iOS configuration](app/ios/Runner/Info.plist)
+- **Android.** Configure Firebase Cloud Messaging and set `PUSH_RELAY_URL` to your Worker's `/push` endpoint. [Android configuration](app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt)
+- **iOS.** Configure APNs and set `DoorbellCompanionRelayURL` to your Worker's HTTPS origin. The Worker serves `/ios` for Home Assistant sign-in and `/push/ios` for VoIP notifications. [iOS configuration](app/ios/Runner/Info.plist)
 
 ## Performance and diagnostics
 
 - **UniFi Protect.** Enable the medium-resolution camera entity in Home Assistant and tap **Refresh** in Doorbell Companion Settings. Doorbell Companion prefers that channel when available, which can reduce startup time on cellular connections.
 - **Android cold starts.** Doorbell Companion caches ICE configuration and uses a long-lived Home Assistant token to reduce round trips when a call arrives.
-- **Android timings.** Run `adb logcat -s ProtectTiming:I ProtectFast:I` to see elapsed times from push receipt through signaling, the snapshot, and the first live frame.
+- **Android timings.** Run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I` to see elapsed times from push receipt through signaling, the snapshot, and the first live frame.
 - **iOS timings.** Filter the Xcode device console for `Doorbell Companion` to see incoming call and playback events.
 
 ## Repository structure

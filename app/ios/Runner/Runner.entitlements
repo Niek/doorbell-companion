@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
 	<key>aps-environment</key>
-	<string>$(PROTECT_FAST_APNS_ENVIRONMENT)</string>
+	<string>$(DOORBELL_COMPANION_APNS_ENVIRONMENT)</string>
 </dict>
 </plist>

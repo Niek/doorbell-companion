@@ -57,7 +57,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
                     for type: PKPushType) {
     guard type == .voIP else { return }
     let value = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
-    let entitlement = Bundle.main.object(forInfoDictionaryKey: "ProtectFastAPNSEnvironment") as? String
+    let entitlement = Bundle.main.object(forInfoDictionaryKey: "DoorbellCompanionAPNSEnvironment") as? String
     let environment = entitlement == "production" ? "production" : "sandbox"
     pushToken = "\(environment):\(value)"
     tokenChanged?()

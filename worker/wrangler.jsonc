@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "protect-fast",
+  "name": "doorbell-companion",
   "account_id": "d99e92492df0494ed614eb4e929a5af1",
   "main": "src/index.js",
   "compatibility_date": "2026-11-12"

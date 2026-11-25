@@ -1,5 +1,4 @@
-const APP_ID = 'nl.niek.protect_fast';
-const IOS_APP_ID = 'nl.niek.protect-fast';
+const APP_ID = 'nl.niek.doorbellcompanion';
 const encoder = new TextEncoder();
 
 let cachedToken = '';
@@ -77,7 +76,7 @@ async function getAPNSToken({ team_id, key_id, private_key }) {
 }
 
 async function sendIOS(body, env, receivedAt) {
-  const topic = env.APNS_BUNDLE_ID || IOS_APP_ID;
+  const topic = env.APNS_BUNDLE_ID || APP_ID;
   if (body.registration_info?.app_id !== topic) {
     return Response.json({ error: 'Unsupported app_id' }, { status: 403 });
   }
@@ -129,7 +128,7 @@ export default {
     if (pathname === '/ios' && request.method === 'GET') {
       return new Response(
         '<!doctype html><html><head><title>Doorbell Companion iOS</title>'
-        + '<link rel="redirect_uri" href="protect-fast://auth-callback">'
+        + '<link rel="redirect_uri" href="doorbell-companion://auth-callback">'
         + '</head><body>Doorbell Companion for iOS</body></html>',
         { headers: { 'content-type': 'text/html; charset=utf-8' } },
       );

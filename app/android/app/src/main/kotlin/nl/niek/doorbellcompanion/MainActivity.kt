@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.Manifest
 import android.app.NotificationManager
@@ -41,7 +41,7 @@ class MainActivity : FlutterActivity() {
                     HomeAssistantAuth.setupPushAutomation(applicationContext)
                 }
             } catch (e: Exception) {
-                Log.w("ProtectFast", "Automation sync error: ${e.message}")
+                Log.w("DoorbellCompanion", "Automation sync error: ${e.message}")
             }
         }
     }
@@ -66,7 +66,7 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        val methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "protect_fast")
+        val methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "doorbell_companion")
         channel = methodChannel
         methodChannel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -163,7 +163,7 @@ class MainActivity : FlutterActivity() {
                             Thread.sleep(3_000L)
                             HomeAssistantAuth.sendTestPushViaHa(applicationContext)
                         } catch (e: Exception) {
-                            Log.w("ProtectFast", "Remote test push failed: ${e.message}")
+                            Log.w("DoorbellCompanion", "Remote test push failed: ${e.message}")
                         }
                     }
                     result.success(null)
@@ -276,7 +276,7 @@ class MainActivity : FlutterActivity() {
             }
             if (match != null) {
                 HomeAssistantAuth.saveInternalUrl(applicationContext, match.internalUrl)
-                Log.i("ProtectFast", "Discovered LAN URL via mDNS for low-latency Wi-Fi calls")
+                Log.i("DoorbellCompanion", "Discovered LAN URL via mDNS for low-latency Wi-Fi calls")
                 passiveLanProbe?.stop()
                 passiveLanProbe = null
             }
@@ -319,11 +319,11 @@ class MainActivity : FlutterActivity() {
                             }
                             val code = Uri.parse("http://127.0.0.1$path").getQueryParameter("code")
                             val html = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
-                                "<meta http-equiv=\"refresh\" content=\"0;url=protectfast://auth-done\"></head>" +
+                                "<meta http-equiv=\"refresh\" content=\"0;url=doorbell-companion://auth-done\"></head>" +
                                 "<body style=\"font-family:sans-serif;padding:32px;text-align:center\">" +
                                 "<h2>Connected to Doorbell Companion</h2><p>Returning to the app…</p></body></html>"
                             val resp = "HTTP/1.1 302 Found\r\n" +
-                                "Location: protectfast://auth-done\r\n" +
+                                "Location: doorbell-companion://auth-done\r\n" +
                                 "Content-Type: text/html; charset=utf-8\r\n" +
                                 "Content-Length: ${html.toByteArray().size}\r\n" +
                                 "Connection: close\r\n\r\n$html"
@@ -377,7 +377,7 @@ class MainActivity : FlutterActivity() {
                 try {
                     HomeAssistantAuth.setupPushAutomation(applicationContext)
                 } catch (e: Exception) {
-                    Log.w("ProtectFast", "Initial push setup note: ${e.message}")
+                    Log.w("DoorbellCompanion", "Initial push setup note: ${e.message}")
                 }
                 main.post {
                     if (!isDestroyed) {
@@ -419,7 +419,7 @@ class MainActivity : FlutterActivity() {
                     try {
                         HomeAssistantAuth.setupPushAutomation(applicationContext)
                     } catch (e: Exception) {
-                        Log.w("ProtectFast", "Auto push setup failed: ${e.message}")
+                        Log.w("DoorbellCompanion", "Auto push setup failed: ${e.message}")
                     }
                 }
             } else {

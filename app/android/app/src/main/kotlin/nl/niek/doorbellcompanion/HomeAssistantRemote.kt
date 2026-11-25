@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -301,7 +301,7 @@ class HomeAssistantRemote(
                     WebRtcEngine.ensureReady(context)
                     schedule { createPeerAndOffer(iceServers) }
                 } catch (e: Exception) {
-                    Log.w("ProtectFast", "WebRTC warmup failed: ${e.javaClass.simpleName}")
+                    Log.w("DoorbellCompanion", "WebRTC warmup failed: ${e.javaClass.simpleName}")
                     reportStatus("Could not start WebRTC")
                 }
             }
@@ -369,7 +369,7 @@ class HomeAssistantRemote(
                             racingSockets.remove(webSocket)
                             authRequiredSockets.remove(webSocket)
                             if (wsAuthed && webSocket !== ws) return@schedule
-                            Log.w("ProtectFast", "HA WebSocket ($label) failed: ${t.javaClass.simpleName}: ${t.message}")
+                            Log.w("DoorbellCompanion", "HA WebSocket ($label) failed: ${t.javaClass.simpleName}: ${t.message}")
                             if (!wsAuthed && racingSockets.isEmpty() && currentVideoTrack == null) {
                                 reportStatus("Could not reach Home Assistant")
                             }
@@ -472,7 +472,7 @@ class HomeAssistantRemote(
                         }
                     } else if (id == offerMsgId && !msg.optBoolean("success", true)) {
                         val err = msg.optJSONObject("error")?.optString("message") ?: "WebRTC offer rejected"
-                        Log.w("ProtectFast", "HA offer failed: $err")
+                        Log.w("DoorbellCompanion", "HA offer failed: $err")
                         reportStatus(err)
                     }
                 }
@@ -503,7 +503,7 @@ class HomeAssistantRemote(
                                         }
                                     }
                                     override fun onSetFailure(error: String) {
-                                        Log.w("ProtectFast", "HA setRemoteDescription failed: $error")
+                                        Log.w("DoorbellCompanion", "HA setRemoteDescription failed: $error")
                                         reportStatus("Camera stream negotiation failed")
                                     }
                                 }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
@@ -526,14 +526,14 @@ class HomeAssistantRemote(
                         }
                         "error" -> {
                             val errMsg = ev.optString("message", "Camera stream error")
-                            Log.w("ProtectFast", "HA WebRTC event error: $errMsg")
+                            Log.w("DoorbellCompanion", "HA WebRTC event error: $errMsg")
                             reportStatus(errMsg)
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.w("ProtectFast", "HA WS message error: ${e.javaClass.simpleName}")
+            Log.w("DoorbellCompanion", "HA WS message error: ${e.javaClass.simpleName}")
         }
     }
 
@@ -551,7 +551,7 @@ class HomeAssistantRemote(
 
             val connection = WebRtcEngine.factory.createPeerConnection(rtcConfig, object : SimplePeerConnectionObserver() {
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                    Log.i("ProtectFast", "HA ICE state: $state")
+                    Log.i("DoorbellCompanion", "HA ICE state: $state")
                     if (state == PeerConnection.IceConnectionState.CONNECTED || state == PeerConnection.IceConnectionState.COMPLETED) {
                         timing?.mark("ice_${state.name.lowercase()}")
                         logSelectedCandidatePair()
@@ -629,7 +629,7 @@ class HomeAssistantRemote(
                 override fun onCreateFailure(error: String) { reportStatus("Could not create WebRTC offer") }
             }, MediaConstraints())
         } catch (e: Exception) {
-            Log.w("ProtectFast", "HA PeerConnection setup failed: ${e.javaClass.simpleName}")
+            Log.w("DoorbellCompanion", "HA PeerConnection setup failed: ${e.javaClass.simpleName}")
             reportStatus("Could not start WebRTC")
         }
     }
@@ -674,7 +674,7 @@ class HomeAssistantRemote(
                 val localProto = localId?.let { statsMap[it]?.members?.get("protocol") } ?: "?"
                 val remoteType = remoteId?.let { statsMap[it]?.members?.get("candidateType") } ?: "?"
                 val rttMs = (pair.members["currentRoundTripTime"] as? Number)?.let { (it.toDouble() * 1000).toInt() } ?: -1
-                Log.i("ProtectFast", "ICE pair: local=$localType/$localProto <-> remote=$remoteType rtt=${rttMs}ms")
+                Log.i("DoorbellCompanion", "ICE pair: local=$localType/$localProto <-> remote=$remoteType rtt=${rttMs}ms")
             } catch (_: Exception) {}
         }
     }
@@ -753,10 +753,10 @@ class HomeAssistantRemote(
             track.setEnabled(attached && !micMuted)
             micAttached = attached
             onMicState(attached)
-            Log.i("ProtectFast", "HA talkback microphone attached: $attached")
+            Log.i("DoorbellCompanion", "HA talkback microphone attached: $attached")
             reportStatus(if (attached) "Connected • Two-way audio" else "Connected • Live audio (1-way)")
         } catch (e: Exception) {
-            Log.w("ProtectFast", "HA microphone attach failed: ${e.javaClass.simpleName}")
+            Log.w("DoorbellCompanion", "HA microphone attach failed: ${e.javaClass.simpleName}")
             micAttached = false
             onMicState(false)
             reportStatus("Connected • Live audio")
@@ -827,7 +827,7 @@ class HomeAssistantRemote(
                 @Suppress("DEPRECATION")
                 WifiManager.WIFI_MODE_FULL_HIGH_PERF
             }
-            wifiLock = wifi.createWifiLock(mode, "protect_fast:call")?.apply {
+            wifiLock = wifi.createWifiLock(mode, "doorbell_companion:call")?.apply {
                 setReferenceCounted(false)
                 acquire()
             }
@@ -858,7 +858,7 @@ class HomeAssistantRemote(
                     peer?.dispose()
                     audioSource?.dispose()
                 } catch (e: Exception) {
-                    Log.w("ProtectFast", "HA cleanup error: ${e.javaClass.simpleName}")
+                    Log.w("DoorbellCompanion", "HA cleanup error: ${e.javaClass.simpleName}")
                 } finally {
                     executor.shutdown()
                 }

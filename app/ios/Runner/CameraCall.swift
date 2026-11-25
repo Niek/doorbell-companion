@@ -103,7 +103,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
     guard let connection = Self.factory.peerConnection(with: configuration, constraints: constraints,
                                                         delegate: self) else {
-      throw ProtectFastError("Could not start WebRTC")
+      throw DoorbellCompanionError("Could not start WebRTC")
     }
     self.connection = connection
     let video = RTCRtpTransceiverInit()
@@ -125,7 +125,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       let message = try await socket.receive()
       guard message["id"] as? Int == id else { continue }
       if message["type"] as? String == "result" && message["success"] as? Bool == false {
-        throw ProtectFastError("Home Assistant rejected the WebRTC offer")
+        throw DoorbellCompanionError("Home Assistant rejected the WebRTC offer")
       }
       guard let event = message["event"] as? JSON else { continue }
       switch event["type"] as? String {
@@ -154,7 +154,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         if remoteDescriptionSet { try await connection.add(candidate) }
         else { remoteCandidates.append(candidate) }
       case "error":
-        throw ProtectFastError(event["message"] as? String ?? "Home Assistant WebRTC error")
+        throw DoorbellCompanionError(event["message"] as? String ?? "Home Assistant WebRTC error")
       default:
         break
       }
@@ -209,7 +209,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       socket?.close()
       throw CancellationError()
     }
-    guard let socket else { throw ProtectFastError("Home Assistant WebSocket is unreachable") }
+    guard let socket else { throw DoorbellCompanionError("Home Assistant WebSocket is unreachable") }
     return socket
   }
 
@@ -311,7 +311,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         self.status = "Live"
       case .failed:
         self.status = "Camera connection failed"
-        self.didFail?(ProtectFastError(self.status))
+        self.didFail?(DoorbellCompanionError(self.status))
       default:
         return
       }

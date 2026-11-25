@@ -1,4 +1,4 @@
-package nl.niek.protect_fast
+package nl.niek.doorbellcompanion
 
 import android.Manifest
 import android.app.Activity
@@ -301,7 +301,7 @@ class CallActivity : Activity() {
             override fun onFirstFrameRendered() {
                 val ms = SystemClock.elapsedRealtime() - callStart
                 timing?.mark("first_frame_rendered")
-                Log.i("ProtectFast", "HA video first frame after $ms ms")
+                Log.i("DoorbellCompanion", "HA video first frame after $ms ms")
                 runOnUiThread {
                     if (!isDestroyed) {
                         firstFrameRendered = true
@@ -314,7 +314,7 @@ class CallActivity : Activity() {
                 }
             }
             override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) {
-                Log.i("ProtectFast", "HA video resolution: ${width}x${height} rot=$rotation")
+                Log.i("DoorbellCompanion", "HA video resolution: ${width}x${height} rot=$rotation")
             }
         })
         rendererInitialized = true

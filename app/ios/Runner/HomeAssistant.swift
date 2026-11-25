@@ -3,7 +3,7 @@ import Security
 
 typealias JSON = [String: Any]
 
-struct ProtectFastError: LocalizedError {
+struct DoorbellCompanionError: LocalizedError {
   var errorDescription: String?
   init(_ message: String) { errorDescription = message }
 }
@@ -34,8 +34,8 @@ struct HACredentials: Codable {
 
 @MainActor
 final class HomeAssistant {
-  static let callback = "protect-fast://auth-callback"
-  static let relayURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "ProtectFastRelayURL") as? String ?? "")!
+  static let callback = "doorbell-companion://auth-callback"
+  static let relayURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "DoorbellCompanionRelayURL") as? String ?? "")!
   static var clientID: String { relayURL.appendingPathComponent("ios").absoluteString }
 
   private let defaults = UserDefaults.standard
@@ -63,9 +63,8 @@ final class HomeAssistant {
     urls.removeAll { !seen.insert($0).inserted }
     return urls
   }
-  // Home Assistant derives the notify service from this registration name.
-  var name: String { "Protect Fast iOS \(deviceID)" }
-  var automationID: String { "protect_fast_ios_\(deviceID)" }
+  var name: String { "Doorbell Companion iOS \(deviceID)" }
+  var automationID: String { "doorbell_companion_ios_\(deviceID)" }
   private var notifyService: String { "mobile_app_\(automationID)" }
 
   init() {
@@ -91,10 +90,10 @@ final class HomeAssistant {
           let host = components?.host, !host.isEmpty,
           components?.user == nil, components?.password == nil,
           components?.query == nil, components?.fragment == nil else {
-      throw ProtectFastError("Enter a valid Home Assistant URL")
+      throw DoorbellCompanionError("Enter a valid Home Assistant URL")
     }
     while components?.path.hasSuffix("/") == true { components?.path.removeLast() }
-    guard let url = components?.url else { throw ProtectFastError("Invalid Home Assistant URL") }
+    guard let url = components?.url else { throw DoorbellCompanionError("Invalid Home Assistant URL") }
     return url
   }
 
@@ -105,7 +104,7 @@ final class HomeAssistant {
     ])
     guard let access = response["access_token"] as? String,
           let refresh = response["refresh_token"] as? String else {
-      throw ProtectFastError("Home Assistant did not return sign-in credentials")
+      throw DoorbellCompanionError("Home Assistant did not return sign-in credentials")
     }
     let value = HACredentials(
       url: url, clientID: Self.clientID, refreshToken: refresh, accessToken: access,
@@ -123,12 +122,12 @@ final class HomeAssistant {
 
   func accessToken(forceRefresh: Bool = false) async throws -> String {
     if let refreshTask { return try await refreshTask.value }
-    guard let credentials else { throw ProtectFastError("Sign in to Home Assistant first") }
+    guard let credentials else { throw DoorbellCompanionError("Sign in to Home Assistant first") }
     if !forceRefresh && credentials.expiration.timeIntervalSinceNow > 30 {
       return credentials.accessToken
     }
     let task = Task {
-      var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+      var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
       for endpoint in endpoints {
         do {
           let response = try await tokenResponse(url: endpoint, fields: [
@@ -136,7 +135,7 @@ final class HomeAssistant {
             "client_id": credentials.clientID,
           ])
           guard let access = response["access_token"] as? String else {
-            throw ProtectFastError("Home Assistant did not refresh sign-in credentials")
+            throw DoorbellCompanionError("Home Assistant did not refresh sign-in credentials")
           }
           try Task.checkCancellation()
           var updated = credentials
@@ -161,11 +160,11 @@ final class HomeAssistant {
     let socket = HASocket(baseURL: endpoint, session: webSockets)
     do {
       guard try await socket.receive()["type"] as? String == "auth_required" else {
-        throw ProtectFastError("Unexpected Home Assistant WebSocket response")
+        throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
       }
       try await socket.send(["type": "auth", "access_token": token])
       guard try await socket.receive()["type"] as? String == "auth_ok" else {
-        throw ProtectFastError("Home Assistant rejected the camera session")
+        throw DoorbellCompanionError("Home Assistant rejected the camera session")
       }
       return socket
     } catch {
@@ -176,7 +175,7 @@ final class HomeAssistant {
 
   func refreshDoorbells() async throws {
     let token = try await accessToken()
-    var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+    var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
     for endpoint in endpoints {
       do {
         let socket = try await authorizedSocket(at: endpoint, token: token)
@@ -305,7 +304,7 @@ final class HomeAssistant {
       }
     }
     if deviceRegistration == nil {
-      let appID = Bundle.main.bundleIdentifier ?? "nl.niek.protect-fast"
+      let appID = Bundle.main.bundleIdentifier ?? "nl.niek.doorbellcompanion"
       let response = try await request(at: endpoint, path: "api/mobile_app/registrations",
                                        token: token, json: deviceInfo.merging([
         "device_id": deviceID, "app_id": appID, "app_name": "Doorbell Companion",
@@ -313,7 +312,7 @@ final class HomeAssistant {
       ]) { _, new in new })
       guard let object = try JSONSerialization.jsonObject(with: response) as? JSON,
             let webhook = object["webhook_id"] as? String else {
-        throw ProtectFastError("Home Assistant did not register this iPhone")
+        throw DoorbellCompanionError("Home Assistant did not register this iPhone")
       }
       deviceRegistration = webhook
       registrationServer = url
@@ -393,7 +392,7 @@ final class HomeAssistant {
   }
 
   private func reachableEndpoint(token: String) async throws -> URL {
-    var lastError: Error = ProtectFastError("Home Assistant is unreachable")
+    var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
     for endpoint in [url, localURL, externalURL].compactMap({ $0 }) {
       do {
         _ = try await request(at: endpoint, path: "api/", token: token)
@@ -443,14 +442,14 @@ final class HomeAssistant {
     let (data, response) = try await session.data(for: request)
     guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
           let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
-      throw ProtectFastError("Home Assistant sign-in failed")
+      throw DoorbellCompanionError("Home Assistant sign-in failed")
     }
     return result
   }
 
   private static let keychainQuery: [String: Any] = [
     kSecClass as String: kSecClassGenericPassword,
-    kSecAttrService as String: "nl.niek.protect-fast.home-assistant",
+    kSecAttrService as String: "nl.niek.doorbellcompanion.home-assistant",
     kSecAttrAccount as String: "oauth",
   ]
 
@@ -473,7 +472,7 @@ final class HomeAssistant {
     if status == errSecItemNotFound {
       status = SecItemAdd(keychainQuery.merging(attributes) { _, new in new } as CFDictionary, nil)
     }
-    guard status == errSecSuccess else { throw ProtectFastError("Could not save Home Assistant sign-in") }
+    guard status == errSecSuccess else { throw DoorbellCompanionError("Could not save Home Assistant sign-in") }
   }
 }
 
@@ -503,10 +502,10 @@ final class HASocket {
       switch try await task.receive() {
       case .string(let value): data = Data(value.utf8)
       case .data(let value): data = value
-      @unknown default: throw ProtectFastError("Unknown Home Assistant WebSocket response")
+      @unknown default: throw DoorbellCompanionError("Unknown Home Assistant WebSocket response")
       }
       guard let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
-        throw ProtectFastError("Invalid Home Assistant WebSocket response")
+        throw DoorbellCompanionError("Invalid Home Assistant WebSocket response")
       }
       return result
     } onCancel: {
@@ -520,7 +519,7 @@ final class HASocket {
       let message = try await receive()
       guard message["type"] as? String == "result", message["id"] as? Int == id else { continue }
       guard message["success"] as? Bool == true else {
-        throw ProtectFastError("Home Assistant rejected \(type)")
+        throw DoorbellCompanionError("Home Assistant rejected \(type)")
       }
       return message["result"]
     }
