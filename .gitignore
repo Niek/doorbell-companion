@@ -1,0 +1,5 @@
+.DS_Store
+app/android/local.properties
+worker/.env
+worker/.dev.vars
+worker/.wrangler/

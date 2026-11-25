@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "28857984978",
+    "project_id": "protect-fast",
+    "storage_bucket": "protect-fast.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:28857984978:android:37ec537b8072e32338ca0b",
+        "android_client_info": {
+          "package_name": "nl.niek.protect_fast"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCuA_GJwVGS8GvB0YN5EG8Q-46QXcct_h4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
