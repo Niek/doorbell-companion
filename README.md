@@ -1,20 +1,25 @@
-# Doorbell Companion
+<p align="center"><img src="app/assets/icon/app_logo.png" width="96" alt=""></p>
 
-Fast incoming doorbell calls for **Home Assistant** on **Android and iOS**. Doorbell Companion works with Home Assistant doorbell cameras, including **UniFi Protect**, and starts connecting to your camera while the phone rings.
+<h1 align="center">Doorbell Companion</h1>
 
-| Platform | Incoming call |
-| --- | --- |
-| **Android** | A full-screen lock-screen call shows a snapshot and switches to live video as soon as the first frame arrives. |
-| **iOS** | The native CallKit screen rings on the lock screen. Answer to open Doorbell Companion with a snapshot, live video, and audio. |
+<p align="center">Doorbell rings become phone calls with live video, for Home Assistant on Android and iOS.</p>
+
+<p align="center">
+  <img src="docs/screenshots/call.jpg" width="250" alt="Call screen with live doorbell video">
+  &nbsp;
+  <img src="docs/screenshots/home.png" width="250" alt="Home screen showing three doorbells ready for calls">
+  &nbsp;
+  <img src="docs/screenshots/settings.png" width="250" alt="Settings with a switch per doorbell">
+</p>
+
+When someone rings, your phone shows an incoming call: a full-screen call on Android, the native CallKit screen on iOS. The camera starts connecting while it rings, so video is live by the time you answer. Works with any Home Assistant doorbell, including UniFi Protect.
 
 ## Features
 
-- **Automatic setup.** Discover Home Assistant over Wi-Fi, sign in through your browser, and let Doorbell Companion find your doorbells, register your phone, and create the ring automation.
-- **Fast camera preview.** Fetch a snapshot and start WebRTC signaling as soon as the push arrives. The snapshot stays visible until the live feed renders.
-- **Local and remote connections.** Doorbell Companion tries your local and external Home Assistant WebSockets in parallel when both addresses are available.
-- **Live audio and talkback.** Hear the visitor when you answer. The microphone and mute control are available when Home Assistant and the camera support two-way audio over WebRTC.
-- **Multiple doorbells.** Turn individual doorbells on or off in Settings. Doorbell Companion keeps the Home Assistant automation in sync.
-- **Stateless push relay.** The Cloudflare Worker forwards Home Assistant notifications to Firebase Cloud Messaging for Android and Apple Push Notification service (APNs) for iOS.
+- **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the ring automation for you.
+- **Fast video.** Shows a snapshot right away and switches to WebRTC as soon as the first frame arrives. Local and remote addresses are tried in parallel.
+- **Talkback.** Hear visitors, and talk back when the camera supports two-way audio.
+- **Multiple doorbells.** Turn each one on or off in Settings.
 
 ## How it works
 
@@ -22,64 +27,47 @@ Fast incoming doorbell calls for **Home Assistant** on **Android and iOS**. Door
 flowchart LR
     Doorbell["Doorbell press"] --> HA["Home Assistant automation"]
     HA -->|"mobile_app notification"| Relay["Cloudflare Worker"]
-    Relay -->|"FCM via /push"| Android["Android CallStyle"]
-    Relay -->|"APNs VoIP via /push/ios"| iOS["iOS PushKit and CallKit"]
-    Android --> Stream["Home Assistant snapshot and WebRTC"]
+    Relay -->|"FCM"| Android["Android full-screen call"]
+    Relay -->|"APNs VoIP"| iOS["iOS CallKit"]
+    Android --> Stream["Snapshot + WebRTC from Home Assistant"]
     iOS --> Stream
 ```
 
 ## Requirements
 
-- **Home Assistant** with WebRTC (go2rtc) and a doorbell that exposes a `camera.*` entity and a doorbell `binary_sensor.*` or `event.*` entity. For calls away from home, your phone needs access to your external Home Assistant URL.
-- **Android 8.1+** (API 27+) with Google Play Services.
-- **iOS 15+** on an iPhone. The iOS build needs Apple signing with Push Notifications enabled and a relay configured for APNs VoIP.
-- **Flutter** with Dart `^3.13.0` to build from source. Use the Android SDK and Java 17 for Android, or Xcode on macOS for iOS.
+- Home Assistant with WebRTC (go2rtc), a `camera.*` doorbell, and a doorbell `binary_sensor.*` or `event.*`. Calls away from home need your external Home Assistant URL.
+- Android 8.1+ with Google Play Services, or iOS 15+.
+- Flutter (Dart `^3.13`) to build.
 
-## Build and install
+## Build
 
-### Android
+**Android**
 
 ```sh
 cd app
-flutter pub get
 flutter build apk --release --split-per-abi
 adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ```
 
-### iOS
+**iOS.** Open `app/ios/Runner.xcworkspace`, pick your team, and enable Push Notifications for `nl.niek.doorbellcompanion`. Set `DOORBELL_COMPANION_APNS_ENVIRONMENT` to match your provisioning profile (Debug uses sandbox, Release uses production), then run `flutter run` from `app/`. [Relay setup for iOS](worker/README.md#ios-voip-pushes)
 
-1. Run `flutter pub get` from `app/` and open `app/ios/Runner.xcworkspace` in Xcode.
-2. Select your Apple Developer team for **Runner** and enable Push Notifications for the bundle ID, `nl.niek.doorbellcompanion` by default.
-3. Configure the relay for the APNs environment of your build. Debug uses sandbox and Profile and Release use production by default. Match `DOORBELL_COMPANION_APNS_ENVIRONMENT` to your provisioning profile. [iOS relay setup](worker/README.md#ios-voip-pushes)
-4. Connect your iPhone and run `flutter run -d <iphone-device-id>` from `app/`.
+## Setup
 
-## Connect Home Assistant
+1. Open the app on your home Wi-Fi and pick your Home Assistant, or enter its URL.
+2. Sign in. The app finds your doorbells and creates the automation.
+3. Allow notifications, and on Android full-screen calls. Allow the microphone for talkback.
+4. Tap **Test call**, then **Test push** and lock your phone within 3 seconds.
 
-If you already use a build with an earlier app ID, disconnect it from Home Assistant before setting up the new installation to avoid duplicate rings.
+Moving from a build with an older app ID? Disconnect that one first to avoid double rings.
 
-1. Open **Doorbell Companion** on Wi-Fi and select your discovered instance, or enter its URL manually.
-2. Sign in through your browser. Doorbell Companion discovers your doorbells and creates the Home Assistant automation.
-3. On Android, grant **Notifications** and **Full-screen lockscreen calls** when prompted. On either platform, grant **Microphone** if you want to use talkback with a compatible camera.
-4. Tap **Test call** to check video and audio. To check the full push path, tap **Test push** and lock your phone within 3 seconds.
+## Self-hosting the relay
 
-## Self-host the push relay
+The app uses a hosted relay by default. To run your own, follow the [Worker setup](worker/README.md) and point the app at it with `PUSH_RELAY_URL` in [HomeAssistantAuth.kt](app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt) (Android) and `DoorbellCompanionRelayURL` in [Info.plist](app/ios/Runner/Info.plist) (iOS).
 
-The app defaults to the hosted relay. To run your own Cloudflare Worker, configure the push credentials for the platforms you use. [Worker setup](worker/README.md)
+## Tips
 
-- **Android.** Configure Firebase Cloud Messaging and set `PUSH_RELAY_URL` to your Worker's `/push` endpoint. [Android configuration](app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt)
-- **iOS.** Configure APNs and set `DoorbellCompanionRelayURL` to your Worker's HTTPS origin. The Worker serves `/ios` for Home Assistant sign-in and `/push/ios` for VoIP notifications. [iOS configuration](app/ios/Runner/Info.plist)
-
-## Performance and diagnostics
-
-- **UniFi Protect.** Enable the medium-resolution camera entity in Home Assistant and tap **Refresh** in Doorbell Companion Settings. Doorbell Companion prefers that channel when available, which can reduce startup time on cellular connections.
-- **Android cold starts.** Doorbell Companion caches ICE configuration and uses a long-lived Home Assistant token to reduce round trips when a call arrives.
-- **Android timings.** Run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I` to see elapsed times from push receipt through signaling, the snapshot, and the first live frame.
-- **iOS timings.** Filter the Xcode device console for `Doorbell Companion` to see incoming call and playback events.
-
-## Repository structure
-
-- [`app/`](app/) contains the shared Flutter UI, the Android Kotlin implementation, and the iOS Swift implementation.
-- [`worker/`](worker/) contains the Cloudflare relay for FCM and APNs.
+- **UniFi Protect:** enable the medium-resolution camera entity in Home Assistant and tap refresh in Settings. The app prefers it, which starts video faster on cellular.
+- **Timings:** run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I` on Android, or filter the Xcode console for `Doorbell Companion` on iOS.
 
 ## License
 

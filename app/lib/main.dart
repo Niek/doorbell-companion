@@ -835,7 +835,10 @@ class SettingsScreen extends StatelessWidget {
                         },
                         secondary: Icon(Icons.doorbell_outlined),
                         title: Text(db.name),
-                        subtitle: Text(db.cameraEntityId),
+                        subtitle: Text(
+                          db.cameraEntityId.replaceFirst('camera.', ''),
+                          style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                        ),
                       ),
                   ],
                 ),
