@@ -10,7 +10,9 @@ const b64url = (data) =>
     .replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 
 async function getAccessToken({ client_email, private_key }) {
-  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) {
+    return { token: cachedToken, cacheHit: true };
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const unsigned = [
@@ -46,7 +48,7 @@ async function getAccessToken({ client_email, private_key }) {
   const { access_token, expires_in } = await res.json();
   cachedToken = access_token;
   tokenExpiresAt = Date.now() + expires_in * 1000;
-  return cachedToken;
+  return { token: cachedToken, cacheHit: false };
 }
 
 async function getAPNSToken({ team_id, key_id, private_key }) {
@@ -125,11 +127,12 @@ export default {
   async fetch(request, env) {
     const receivedAt = Date.now();
     const { pathname } = new URL(request.url);
-    if (pathname === '/ios' && request.method === 'GET') {
+    if ((pathname === '/ios' || pathname === '/android') && request.method === 'GET') {
+      const platform = pathname === '/ios' ? 'iOS' : 'Android';
       return new Response(
-        '<!doctype html><html><head><title>Doorbell Companion iOS</title>'
+        `<!doctype html><html><head><title>Doorbell Companion ${platform}</title>`
         + '<link rel="redirect_uri" href="doorbell-companion://auth-callback">'
-        + '</head><body>Doorbell Companion for iOS</body></html>',
+        + `</head><body>Doorbell Companion for ${platform}</body></html>`,
         { headers: { 'content-type': 'text/html; charset=utf-8' } },
       );
     }
@@ -161,9 +164,20 @@ export default {
       ...(extra.event_ms && { event_ms: String(extra.event_ms) }),
     };
 
+    const authStart = performance.now();
+    let authTiming = '';
+    let sendStart;
+    const pushResponse = (body, status) => {
+      const timing = sendStart === undefined
+        ? `fcm_auth;dur=${Math.round(performance.now() - authStart)};desc="error"`
+        : `${authTiming}, fcm_send;dur=${Math.round(performance.now() - sendStart)}`;
+      return Response.json(body, { status, headers: { 'Server-Timing': timing } });
+    };
     try {
       const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
-      const token = await getAccessToken(serviceAccount);
+      const { token, cacheHit } = await getAccessToken(serviceAccount);
+      sendStart = performance.now();
+      authTiming = `fcm_auth;dur=${Math.round(sendStart - authStart)};desc="${cacheHit ? 'hit' : 'miss'}"`;
       const res = await fetch(
         `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(serviceAccount.project_id)}/messages:send`,
         {
@@ -180,12 +194,12 @@ export default {
       );
       if (!res.ok) {
         console.error('FCM /push send failed', res.status, await res.text());
-        return Response.json({ error: 'Firebase send failed' }, { status: 502 });
+        return pushResponse({ error: 'Firebase send failed' }, 502);
       }
-      return Response.json({ success: true });
+      return pushResponse({ success: true }, 200);
     } catch (error) {
       console.error('Push relay failed', error);
-      return Response.json({ error: 'Firebase send failed' }, { status: 502 });
+      return pushResponse({ error: 'Firebase send failed' }, 502);
     }
   },
 };

@@ -4,7 +4,10 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,6 +24,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 data class DoorbellInfo(
@@ -31,6 +35,7 @@ data class DoorbellInfo(
 
 object HomeAssistantAuth {
     const val FALLBACK_CLIENT_ID = "https://doorbell-companion.nivadema.workers.dev"
+    const val ANDROID_CLIENT_ID = "$FALLBACK_CLIENT_ID/android"
     const val PUSH_RELAY_URL = "https://doorbell-companion.nivadema.workers.dev/push"
     private const val PREFS = "doorbell_companion"
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
@@ -44,7 +49,6 @@ object HomeAssistantAuth {
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    @Volatile private var cachedLlat: String? = null
     @Volatile private var cachedToken: String? = null
     @Volatile private var cachedExpiresAt: Long = 0L
     private val tokenLock = Any()
@@ -78,7 +82,7 @@ object HomeAssistantAuth {
     fun disconnect(context: Context) {
         val p = prefs(context)
         val baseUrl = p.getString("ha_url", null)
-        val llat = cachedLlat ?: p.getString("ha_llat", null)
+        val endpoints = listOfNotNull(getInternalUrl(context), baseUrl).distinct()
         val storedAccess = p.getString("ha_access_token", null)
         val storedExp = p.getLong("ha_token_expires_at", 0L)
         val validAccess = storedAccess?.takeIf { System.currentTimeMillis() < storedExp - 60_000L }
@@ -87,7 +91,6 @@ object HomeAssistantAuth {
         val autoId = automationId()
 
         synchronized(tokenLock) {
-            cachedLlat = null
             cachedToken = null
             cachedExpiresAt = 0L
             p.edit()
@@ -114,9 +117,8 @@ object HomeAssistantAuth {
         if (!baseUrl.isNullOrBlank()) {
             ioExecutor.execute {
                 try {
-                    val token = llat?.takeIf { it.isNotBlank() }
-                        ?: validAccess
-                        ?: refresh?.takeIf { it.isNotBlank() }?.let { refreshOAuthToken(baseUrl, it, clientId)?.first }
+                    val token = validAccess
+                        ?: refresh?.takeIf { it.isNotBlank() }?.let { refreshOAuthToken(endpoints, it, clientId)?.first }
                     if (!token.isNullOrBlank()) {
                         deleteAutomation(baseUrl, token, autoId)
                     }
@@ -142,12 +144,27 @@ object HomeAssistantAuth {
         }
     }
 
-    fun exchangeCode(context: Context, baseUrl: String, code: String, clientId: String): Boolean {
+    fun supportsPkce(baseUrl: String): Boolean = try {
+        val request = Request.Builder().url("$baseUrl/.well-known/oauth-authorization-server").build()
+        val call = httpClient.newCall(request)
+        call.timeout().timeout(2, TimeUnit.SECONDS)
+        call.execute().use { response ->
+            val methods = if (response.isSuccessful) {
+                JSONObject(response.body?.string().orEmpty()).optJSONArray("code_challenge_methods_supported")
+            } else null
+            methods != null && (0 until methods.length()).any { methods.optString(it) == "S256" }
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    fun exchangeCode(context: Context, baseUrl: String, code: String, clientId: String, verifier: String?): Boolean {
         val cleanUrl = normalizeBaseUrl(baseUrl)
         val form = FormBody.Builder()
             .add("grant_type", "authorization_code")
             .add("code", code)
             .add("client_id", clientId)
+            .apply { if (verifier != null) add("code_verifier", verifier) }
             .build()
         val req = Request.Builder().url("$cleanUrl/auth/token").post(form).build()
         var lastError: Exception? = null
@@ -162,10 +179,11 @@ object HomeAssistantAuth {
                     if (access.isBlank() || refresh.isBlank()) return false
                     val expiresAt = System.currentTimeMillis() + expiresIn * 1000L
                     synchronized(tokenLock) {
-                        cachedLlat = null
                         cachedToken = access
                         cachedExpiresAt = expiresAt
-                        prefs(context).edit()
+                        val prefs = prefs(context)
+                        prefs.edit()
+                            .apply { if (prefs.getString("ha_url", null) != cleanUrl) remove("ha_internal_url") }
                             .remove("ha_llat")
                             .putString("ha_url", cleanUrl)
                             .putString("ha_client_id", clientId)
@@ -184,16 +202,11 @@ object HomeAssistantAuth {
         throw (lastError ?: IOException("Network unavailable"))
     }
 
-    /** Fast non-blocking check for a cached LLAT or still-valid access token (never hits the network). */
+    /** Fast non-blocking check for a still-valid access token. */
     fun peekAccessToken(context: Context): String? {
-        cachedLlat?.takeIf { it.isNotBlank() }?.let { return it }
         val now = System.currentTimeMillis()
         cachedToken?.takeIf { it.isNotBlank() && now < cachedExpiresAt - 120_000L }?.let { return it }
         val p = prefs(context)
-        p.getString("ha_llat", null)?.takeIf { it.isNotBlank() }?.let {
-            cachedLlat = it
-            return it
-        }
         val stored = p.getString("ha_access_token", null)
         val exp = p.getLong("ha_token_expires_at", 0L)
         if (!stored.isNullOrBlank() && now < exp - 120_000L) {
@@ -210,19 +223,18 @@ object HomeAssistantAuth {
         }
         synchronized(tokenLock) {
             val p = prefs(context)
-            if (forceRefresh) {
-                cachedLlat = null
-                p.edit().remove("ha_llat").apply()
-            } else {
+            if (!forceRefresh) {
                 peekAccessToken(context)?.let { return it }
             }
             val baseUrl = p.getString("ha_url", null) ?: return null
             val refresh = p.getString("ha_refresh_token", null) ?: return null
             val clientId = p.getString("ha_client_id", FALLBACK_CLIENT_ID) ?: FALLBACK_CLIENT_ID
-            val refreshed = refreshOAuthToken(baseUrl, refresh, clientId) ?: return null
+            val endpoints = listOfNotNull(getInternalUrl(context), baseUrl).distinct()
+            val refreshed = refreshOAuthToken(endpoints, refresh, clientId) ?: return null
             cachedToken = refreshed.first
             cachedExpiresAt = refreshed.second
             p.edit()
+                .remove("ha_llat")
                 .putString("ha_access_token", refreshed.first)
                 .putLong("ha_token_expires_at", refreshed.second)
                 .apply()
@@ -230,28 +242,49 @@ object HomeAssistantAuth {
         }
     }
 
-    private fun refreshOAuthToken(baseUrl: String, refreshToken: String, clientId: String): Pair<String, Long>? {
+    private fun refreshOAuthToken(endpoints: List<String>, refreshToken: String, clientId: String): Pair<String, Long>? {
         val form = FormBody.Builder()
             .add("grant_type", "refresh_token")
             .add("refresh_token", refreshToken)
             .add("client_id", clientId)
             .build()
-        val req = Request.Builder().url("$baseUrl/auth/token").post(form).build()
-        return try {
-            httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.w("DoorbellCompanion", "HA token refresh failed: HTTP ${resp.code}")
-                    return null
-                }
-                val body = JSONObject(resp.body?.string() ?: return null)
-                val access = body.optString("access_token")
-                if (access.isBlank()) return null
-                val expiresAt = System.currentTimeMillis() + body.optLong("expires_in", 1800L) * 1000L
-                access to expiresAt
+        val calls = endpoints.mapNotNull { endpoint ->
+            val url = endpoint.toHttpUrlOrNull() ?: return@mapNotNull null
+            val request = Request.Builder().url(url.newBuilder().addPathSegments("auth/token").build()).post(form).build()
+            httpClient.newCall(request).apply { timeout().timeout(8, TimeUnit.SECONDS) }
+        }
+        if (calls.isEmpty()) return null
+        val result = AtomicReference<Pair<String, Long>?>(null)
+        val pending = AtomicInteger(calls.size)
+        val done = CountDownLatch(1)
+        val callback = object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (pending.decrementAndGet() == 0) done.countDown()
             }
-        } catch (e: Exception) {
-            Log.w("DoorbellCompanion", "HA token refresh error: ${e.javaClass.simpleName}")
-            null
+
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    response.use {
+                        if (!it.isSuccessful) return
+                        val body = JSONObject(it.body?.string().orEmpty())
+                        val token = body.optString("access_token")
+                        if (token.isBlank()) return
+                        val expiresAt = System.currentTimeMillis() + body.optLong("expires_in", 1800L) * 1000L
+                        if (result.compareAndSet(null, token to expiresAt)) done.countDown()
+                    }
+                } catch (_: Exception) {
+                    // The other endpoint may still return a usable token.
+                } finally {
+                    if (pending.decrementAndGet() == 0) done.countDown()
+                }
+            }
+        }
+        return try {
+            calls.forEach { it.enqueue(callback) }
+            done.await(8, TimeUnit.SECONDS)
+            result.get().also { if (it == null) Log.w("DoorbellCompanion", "HA token refresh failed") }
+        } finally {
+            calls.forEach { it.cancel() }
         }
     }
 
@@ -276,14 +309,13 @@ object HomeAssistantAuth {
     fun discoverDoorbellsAndWarmup(context: Context): List<DoorbellInfo> {
         val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
         val p = prefs(context)
-        val needLlat = p.getString("ha_llat", null).isNullOrBlank()
         var token = getAccessToken(context) ?: error("Could not authenticate with Home Assistant")
 
-        var results = runWarmupSession(baseUrl, token, needLlat)
+        var results = runWarmupSession(baseUrl, token)
         if (results == null) {
-            // Token (possibly revoked LLAT) was rejected; force OAuth refresh and retry once.
+            // The cached access token was rejected. Refresh it and retry once.
             token = getAccessToken(context, forceRefresh = true) ?: error("Authentication rejected by Home Assistant")
-            results = runWarmupSession(baseUrl, token, needLlat = true)
+            results = runWarmupSession(baseUrl, token)
                 ?: error("Authentication rejected by Home Assistant")
         }
 
@@ -319,17 +351,6 @@ object HomeAssistantAuth {
         }
         editor.putStringSet("ha_two_way_cameras", twoWayCameras)
             .remove("ha_two_way_audio")
-        val llatRes = msgMap[902]
-        if (llatRes != null && llatRes.optBoolean("success")) {
-            val llat = llatRes.optString("result")
-            if (llat.isNotBlank() && llat != "null") {
-                synchronized(tokenLock) {
-                    cachedLlat = llat
-                    editor.putString("ha_llat", llat)
-                }
-                Log.i("DoorbellCompanion", "Saved long-lived HA token for zero-RTT call auth")
-            }
-        }
         editor.apply()
         return doorbells
     }
@@ -338,7 +359,6 @@ object HomeAssistantAuth {
     private fun runWarmupSession(
         baseUrl: String,
         token: String,
-        needLlat: Boolean,
     ): Pair<List<DoorbellInfo>, Map<Int, JSONObject>>? {
         val results = ConcurrentHashMap<Int, JSONObject>()
         val phase1Ids = listOf(1, 2, 3, 4)
@@ -404,17 +424,6 @@ object HomeAssistantAuth {
                                     webSocket.send(
                                         JSONObject().put("id", capId).put("type", "camera/capabilities")
                                             .put("entity_id", db.cameraEntityId).toString()
-                                    )
-                                }
-                                if (needLlat) {
-                                    expectedPhase2Ids.add(902)
-                                    webSocket.send(
-                                        JSONObject()
-                                            .put("id", 902)
-                                            .put("type", "auth/long_lived_access_token")
-                                            .put("client_name", "Doorbell Companion ${Build.MODEL} (${System.currentTimeMillis() / 1000})")
-                                            .put("lifespan", 3650)
-                                            .toString()
                                     )
                                 }
                                 if (expectedPhase2Ids.isEmpty()) latch.countDown()

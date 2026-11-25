@@ -97,6 +97,7 @@ class DoorbellCompanionController extends ChangeNotifier {
   List<DiscoveredInstance> discovered = const [];
   String? oauthProgress;
   String? oauthError;
+  String? oauthUrl;
   bool refreshing = false;
   bool testPushPending = false;
 
@@ -122,16 +123,19 @@ class DoorbellCompanionController extends ChangeNotifier {
       case 'onOAuthProgress':
         oauthProgress = call.arguments as String?;
         oauthError = null;
+        oauthUrl = null;
         notifyListeners();
       case 'onOAuthComplete':
         oauthProgress = null;
         oauthError = null;
+        oauthUrl = null;
         final raw = call.arguments as Map<Object?, Object?>?;
         if (raw != null) status = AppStatus.fromMap(raw);
         notifyListeners();
       case 'onOAuthError':
         oauthProgress = null;
         oauthError = (call.arguments as String?) ?? 'Connection failed';
+        oauthUrl = null;
         startDiscovery();
         notifyListeners();
     }
@@ -154,23 +158,26 @@ class DoorbellCompanionController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> startOAuth(String url) async {
+  Future<void> startOAuth(String url, {bool local = false}) async {
     url = url.trim();
     if (url.isEmpty) return;
     oauthError = null;
+    oauthUrl = local ? null : url;
     oauthProgress = 'Continue in browser…';
     notifyListeners();
     try {
-      await _channel.invokeMethod('startOAuth', {'url': url});
+      await _channel.invokeMethod('startOAuth', {'url': url, 'local': local});
     } on PlatformException catch (e) {
       oauthProgress = null;
       oauthError = e.message ?? 'Invalid URL';
+      oauthUrl = null;
       notifyListeners();
     }
   }
 
   Future<void> cancelOAuth() async {
     oauthProgress = null;
+    oauthUrl = null;
     notifyListeners();
     try {
       await _channel.invokeMethod('cancelOAuth');
@@ -489,6 +496,11 @@ class _OnboardingBody extends StatelessWidget {
               const SizedBox(height: 20),
               Text(progress, style: theme.textTheme.titleMedium, textAlign: TextAlign.center),
               const SizedBox(height: 16),
+              if (theme.platform == TargetPlatform.android && controller.oauthUrl != null)
+                TextButton(
+                  onPressed: () => controller.startOAuth(controller.oauthUrl!, local: true),
+                  child: const Text('Use local sign-in'),
+                ),
               TextButton(
                 onPressed: controller.cancelOAuth,
                 child: const Text('Cancel'),

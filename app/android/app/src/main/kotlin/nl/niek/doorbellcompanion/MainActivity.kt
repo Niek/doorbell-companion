@@ -20,19 +20,36 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
-import java.net.URLEncoder
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.Base64
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
+    private data class PendingOAuth(val baseUrl: String, val clientId: String, val state: String, val verifier: String?)
+
     private val main = Handler(Looper.getMainLooper())
     private val syncExecutor = Executors.newSingleThreadExecutor()
     private var channel: MethodChannel? = null
     private var discovery: HomeAssistantDiscovery? = null
     private var passiveLanProbe: HomeAssistantDiscovery? = null
     private val discoveredInternalUrls = mutableMapOf<String, String>()
-    @Volatile private var loopbackSocket: ServerSocket? = null
-    private var pendingBaseUrl: String = ""
+    private var loopbackSocket: ServerSocket? = null
+    private var pendingOAuth: PendingOAuth? = null
+    private var oauthAttempt = 0
+    private val random = SecureRandom()
+    private val base64Url = Base64.getUrlEncoder().withoutPadding()
+    private val hostedOAuth by lazy { getSharedPreferences("pending_hosted_oauth", MODE_PRIVATE) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handleOAuthCallback(intent.data)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleOAuthCallback(intent.data)
+    }
 
     private val syncAutomationRunnable = Runnable {
         syncExecutor.execute {
@@ -82,13 +99,13 @@ class MainActivity : FlutterActivity() {
                     if (rawUrl.isEmpty()) {
                         result.error("INVALID_URL", "Enter a Home Assistant URL", null)
                     } else {
-                        startBrowserOAuth(HomeAssistantAuth.normalizeBaseUrl(rawUrl))
+                        startBrowserOAuth(HomeAssistantAuth.normalizeBaseUrl(rawUrl), call.argument<Boolean>("local") == true)
                         result.success(null)
                     }
                 }
 
                 "cancelOAuth" -> {
-                    closeLoopback()
+                    cancelPendingOAuth()
                     startMdnsDiscovery()
                     result.success(null)
                 }
@@ -330,33 +347,89 @@ class MainActivity : FlutterActivity() {
         }, 4_000L)
     }
 
-    private fun startBrowserOAuth(baseUrl: String) {
-        pendingBaseUrl = baseUrl
+    private fun startBrowserOAuth(baseUrl: String, local: Boolean) {
         discovery?.stop()
         discovery = null
-        closeLoopback()
+        cancelPendingOAuth()
+        if (local) {
+            startLoopbackOAuth(baseUrl)
+            return
+        }
+        val attempt = oauthAttempt
+        HomeAssistantAuth.ioExecutor.execute {
+            val supportsPkce = HomeAssistantAuth.supportsPkce(baseUrl)
+            main.post {
+                if (isDestroyed || attempt != oauthAttempt) return@post
+                if (supportsPkce) {
+                    val pending = PendingOAuth(baseUrl, HomeAssistantAuth.ANDROID_CLIENT_ID, oauthNonce(), oauthNonce())
+                    launchOAuth(pending, "doorbell-companion://auth-callback")
+                } else {
+                    startLoopbackOAuth(baseUrl)
+                }
+            }
+        }
+    }
 
+    private fun oauthNonce(): String = base64Url.encodeToString(ByteArray(32).also(random::nextBytes))
+
+    private fun launchOAuth(pending: PendingOAuth, redirectUri: String) {
+        pendingOAuth = pending
+        val url = Uri.parse("${pending.baseUrl}/auth/authorize").buildUpon()
+            .appendQueryParameter("response_type", "code")
+            .appendQueryParameter("client_id", pending.clientId)
+            .appendQueryParameter("redirect_uri", redirectUri)
+            .appendQueryParameter("state", pending.state)
+        pending.verifier?.let { verifier ->
+            // The browser can return through a new activity or after process recreation.
+            hostedOAuth.edit()
+                .putString("url", pending.baseUrl)
+                .putString("state", pending.state)
+                .putString("verifier", verifier)
+                .putLong("expires", System.currentTimeMillis() + 10 * 60_000)
+                .apply()
+            val challenge = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
+            url.appendQueryParameter("code_challenge", base64Url.encodeToString(challenge))
+                .appendQueryParameter("code_challenge_method", "S256")
+        }
+        if (!openCustomTab(url.build().toString())) {
+            cancelPendingOAuth()
+            channel?.invokeMethod("onOAuthError", "No browser app found to sign in")
+        }
+    }
+
+    private fun handleOAuthCallback(uri: Uri?) {
+        if (uri == null || uri.scheme != "doorbell-companion" ||
+            uri.encodedAuthority != "auth-callback" || !uri.encodedPath.isNullOrEmpty()
+        ) return
+        if (System.currentTimeMillis() >= hostedOAuth.getLong("expires", 0)) return
+        val state = hostedOAuth.getString("state", null) ?: return
+        if (uri.getQueryParameter("state") != state) return
+        val url = hostedOAuth.getString("url", null) ?: return
+        val verifier = hostedOAuth.getString("verifier", null) ?: return
+        completeOAuthCode(uri.getQueryParameter("code"), PendingOAuth(url, HomeAssistantAuth.ANDROID_CLIENT_ID, state, verifier))
+    }
+
+    private fun startLoopbackOAuth(baseUrl: String) {
         try {
             val server = ServerSocket(0, 5, InetAddress.getByName("127.0.0.1"))
             loopbackSocket = server
-            val port = server.localPort
-            val clientId = "http://127.0.0.1:$port"
-            val redirectUri = "$clientId/callback"
-            val handled = AtomicBoolean(false)
+            val clientId = "http://127.0.0.1:${server.localPort}"
+            val pending = PendingOAuth(baseUrl, clientId, oauthNonce(), null)
 
             HomeAssistantAuth.ioExecutor.execute {
                 try {
-                    while (!server.isClosed && !handled.get()) {
+                    while (!server.isClosed) {
                         server.accept().use { client ->
                             client.soTimeout = 5_000
                             val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.UTF_8))
                             val reqLine = reader.readLine() ?: return@use
-                            val path = reqLine.split(' ').getOrNull(1) ?: "/"
-                            if (!path.startsWith("/callback")) {
-                                client.getOutputStream().write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n".toByteArray())
+                            val path = reqLine.split(' ').getOrNull(1) ?: return@use
+                            val callback = Uri.parse("$clientId$path")
+                            if (callback.path != "/callback" || callback.getQueryParameter("state") != pending.state) {
+                                client.getOutputStream().write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".toByteArray())
                                 return@use
                             }
-                            val code = Uri.parse("http://127.0.0.1$path").getQueryParameter("code")
+                            val code = callback.getQueryParameter("code")
                             val html = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
                                 "<meta http-equiv=\"refresh\" content=\"0;url=doorbell-companion://auth-done\"></head>" +
                                 "<body style=\"font-family:sans-serif;padding:32px;text-align:center\">" +
@@ -370,16 +443,14 @@ class MainActivity : FlutterActivity() {
                                 write(resp.toByteArray())
                                 flush()
                             }
-                            if (handled.compareAndSet(false, true)) {
-                                closeLoopback()
-                                main.post {
-                                    if (!isDestroyed) {
-                                        startActivity(
-                                            Intent(this@MainActivity, MainActivity::class.java)
-                                                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                                        )
-                                        completeOAuthCode(code, clientId)
-                                    }
+                            server.close()
+                            main.post {
+                                if (!isDestroyed && pendingOAuth === pending) {
+                                    startActivity(
+                                        Intent(this@MainActivity, MainActivity::class.java)
+                                            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                                    )
+                                    completeOAuthCode(code, pending)
                                 }
                             }
                         }
@@ -387,29 +458,24 @@ class MainActivity : FlutterActivity() {
                 } catch (_: Exception) {}
             }
 
-            val authUrl = "$baseUrl/auth/authorize?response_type=code" +
-                "&client_id=${URLEncoder.encode(clientId, "UTF-8")}" +
-                "&redirect_uri=${URLEncoder.encode(redirectUri, "UTF-8")}"
-            if (!openCustomTab(authUrl)) {
-                closeLoopback()
-                channel?.invokeMethod("onOAuthError", "No browser app found to sign in")
-            }
+            launchOAuth(pending, "$clientId/callback")
         } catch (e: Exception) {
-            closeLoopback()
+            cancelPendingOAuth()
             channel?.invokeMethod("onOAuthError", e.message ?: "Could not open browser")
         }
     }
 
-    private fun completeOAuthCode(code: String?, clientId: String) {
+    private fun completeOAuthCode(code: String?, pending: PendingOAuth) {
+        cancelPendingOAuth()
         if (code.isNullOrBlank()) {
             channel?.invokeMethod("onOAuthError", "Sign-in was cancelled")
             return
         }
         channel?.invokeMethod("onOAuthProgress", "Discovering doorbells & setting up notifications…")
-        val knownInternalUrl = discoveredInternalUrls[pendingBaseUrl]
+        val knownInternalUrl = discoveredInternalUrls[pending.baseUrl]
         syncExecutor.execute {
             try {
-                val ok = HomeAssistantAuth.exchangeCode(applicationContext, pendingBaseUrl, code, clientId)
+                val ok = HomeAssistantAuth.exchangeCode(applicationContext, pending.baseUrl, code, pending.clientId, pending.verifier)
                 if (!ok) error("Token exchange failed")
                 HomeAssistantAuth.saveInternalUrl(applicationContext, knownInternalUrl)
                 HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
@@ -465,6 +531,13 @@ class MainActivity : FlutterActivity() {
                 HomeAssistantAuth.syncPushTokenIfRegistered(this, token)
             }
         }
+    }
+
+    private fun cancelPendingOAuth() {
+        oauthAttempt++
+        pendingOAuth = null
+        hostedOAuth.edit().clear().apply()
+        closeLoopback()
     }
 
     private fun closeLoopback() {

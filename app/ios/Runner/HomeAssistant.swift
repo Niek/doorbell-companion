@@ -111,6 +111,12 @@ final class HomeAssistant {
       expiration: Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
     )
     try Self.saveCredentials(value)
+    if credentials?.url != url {
+      localURL = nil
+      externalURL = nil
+      defaults.removeObject(forKey: "local_url")
+      defaults.removeObject(forKey: "external_url")
+    }
     credentials = value
     if registrationServer != url {
       deviceRegistration = nil
@@ -126,30 +132,37 @@ final class HomeAssistant {
     if !forceRefresh && credentials.expiration.timeIntervalSinceNow > 30 {
       return credentials.accessToken
     }
+    let candidates = endpoints
+    let fields = [
+      "grant_type": "refresh_token", "refresh_token": credentials.refreshToken,
+      "client_id": credentials.clientID,
+    ]
     let task = Task {
-      var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
-      for endpoint in endpoints {
-        do {
-          let response = try await tokenResponse(url: endpoint, fields: [
-            "grant_type": "refresh_token", "refresh_token": credentials.refreshToken,
-            "client_id": credentials.clientID,
-          ])
-          guard let access = response["access_token"] as? String else {
-            throw DoorbellCompanionError("Home Assistant did not refresh sign-in credentials")
+      let refreshed = await withTaskGroup(of: HACredentials?.self, returning: HACredentials?.self) { group in
+        for endpoint in candidates {
+          group.addTask { @MainActor in
+            guard let response = try? await self.tokenResponse(url: endpoint, fields: fields),
+                  let access = response["access_token"] as? String, !access.isEmpty else { return nil }
+            var updated = credentials
+            updated.accessToken = access
+            updated.expiration = Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
+            return updated
           }
-          try Task.checkCancellation()
-          var updated = credentials
-          updated.accessToken = access
-          updated.expiration = Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
-          try Self.saveCredentials(updated)
-          self.credentials = updated
-          return access
-        } catch {
-          try Task.checkCancellation()
-          lastError = error
         }
+        for await result in group {
+          if let result {
+            group.cancelAll()
+            return result
+          }
+        }
+        return nil
       }
-      throw lastError
+      try Task.checkCancellation()
+      guard self.credentials?.refreshToken == credentials.refreshToken else { throw CancellationError() }
+      guard let refreshed else { throw DoorbellCompanionError("Home Assistant could not refresh sign-in credentials") }
+      try Self.saveCredentials(refreshed)
+      self.credentials = refreshed
+      return refreshed.accessToken
     }
     refreshTask = task
     defer { refreshTask = nil }
@@ -157,12 +170,18 @@ final class HomeAssistant {
   }
 
   func authorizedSocket(at endpoint: URL, token: String) async throws -> HASocket {
+    try await authorizedSocket(at: endpoint) { token }
+  }
+
+  func authorizedSocket(at endpoint: URL, token: () async throws -> String) async throws -> HASocket {
     let socket = HASocket(baseURL: endpoint, session: webSockets)
     do {
       guard try await socket.receive()["type"] as? String == "auth_required" else {
         throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
       }
-      try await socket.send(["type": "auth", "access_token": token])
+      let access = try await token()
+      try Task.checkCancellation()
+      try await socket.send(["type": "auth", "access_token": access])
       guard try await socket.receive()["type"] as? String == "auth_ok" else {
         throw DoorbellCompanionError("Home Assistant rejected the camera session")
       }

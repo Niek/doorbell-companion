@@ -2,6 +2,8 @@
 
 Stateless Cloudflare Worker that relays Home Assistant doorbell notifications for Doorbell Companion. Android uses FCM through `/push`, and iOS uses APNs VoIP through `/push/ios`.
 
+The `/android` and `/ios` pages declare the direct app callback for Home Assistant sign-in. Android `/push` responses include `Server-Timing` measurements for Google token acquisition and FCM submission, with the token cache hit or miss marked on `fcm_auth`.
+
 Home Assistant passes each user's Firebase registration token (`push_token`) directly in the `POST /push` request body, so a single deployed Worker serves any number of Home Assistant installations with zero database or stored user state.
 
 ## Android setup

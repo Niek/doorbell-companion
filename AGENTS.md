@@ -7,7 +7,7 @@ Doorbell Companion handles incoming doorbell calls from Home Assistant on Androi
 - [`app/lib/`](app/lib/) contains the shared Flutter UI.
 - [`app/android/`](app/android/) contains the native Kotlin implementation for FCM, full-screen calls, and camera playback.
 - [`app/ios/Runner/`](app/ios/Runner/) contains the native Swift implementation for PushKit, CallKit, and camera playback.
-- [`worker/`](worker/) contains the stateless Cloudflare push relay. It serves `/push` for Android FCM, `/push/ios` for iOS VoIP pushes, and `/ios` for iOS Home Assistant sign-in.
+- [`worker/`](worker/) contains the stateless Cloudflare push relay. It serves `/push` for Android FCM, `/push/ios` for iOS VoIP pushes, and `/android` and `/ios` for Home Assistant sign-in.
 
 The Android application ID and iOS bundle ID are both `nl.niek.doorbellcompanion`.
 

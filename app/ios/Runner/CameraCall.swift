@@ -57,11 +57,12 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   }
 
   private func connect() async throws {
-    let token = try await home.accessToken()
     try Task.checkCancellation()
     let endpoints = home.endpoints
+    let tokenTask = Task { [home] in try await home.accessToken() }
+    defer { tokenTask.cancel() }
     snapshotTask = Task { [weak self] in
-      guard let self else { return }
+      guard let self, let token = try? await tokenTask.value, !Task.isCancelled else { return }
       let data = await withTaskGroup(of: Data?.self, returning: Data?.self) { group in
         for endpoint in endpoints {
           group.addTask { @MainActor [home = self.home, bell = self.bell] in
@@ -81,7 +82,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       mark("snapshot_ready")
       didChange?()
     }
-    let socket = try await firstAuthorizedSocket(endpoints: endpoints, token: token)
+    let socket = try await firstAuthorizedSocket(endpoints: endpoints, tokenTask: tokenTask)
     self.socket = socket
     try Task.checkCancellation()
 
@@ -161,7 +162,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     }
   }
 
-  private func firstAuthorizedSocket(endpoints: [URL], token: String) async throws -> HASocket {
+  private func firstAuthorizedSocket(endpoints: [URL], tokenTask: Task<String, Error>) async throws -> HASocket {
     enum Attempt {
       case endpoint(HASocket?)
       case timeout
@@ -169,7 +170,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     let socket = await withTaskGroup(of: Attempt.self, returning: HASocket?.self) { group in
       for endpoint in endpoints {
         group.addTask { @MainActor [home] in
-          let socket = try? await home.authorizedSocket(at: endpoint, token: token)
+          let socket = try? await home.authorizedSocket(at: endpoint) { try await tokenTask.value }
           if Task.isCancelled {
             socket?.close()
             return .endpoint(nil)
