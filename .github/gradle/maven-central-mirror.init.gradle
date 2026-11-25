@@ -1,0 +1,31 @@
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+def mirrorUrl = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+def mirrorCentral = { repositories ->
+    repositories.withType(MavenArtifactRepository).configureEach { repository ->
+        if (repository.name == ArtifactRepositoryContainer.DEFAULT_MAVEN_CENTRAL_REPO_NAME) {
+            repository.setUrl(mirrorUrl)
+        }
+    }
+}
+
+gradle.beforeSettings { settings ->
+    mirrorCentral(settings.buildscript.repositories)
+    mirrorCentral(settings.pluginManagement.repositories)
+    mirrorCentral(settings.dependencyResolutionManagement.repositories)
+}
+
+gradle.settingsEvaluated { settings ->
+    // Flutter's included build uses the implicit Plugin Portal, which can redirect to Central.
+    def repositories = settings.pluginManagement.repositories
+    if (repositories.isEmpty()) {
+        repositories.maven { url = mirrorUrl }
+        repositories.gradlePluginPortal()
+    }
+}
+
+gradle.beforeProject { project ->
+    mirrorCentral(project.buildscript.repositories)
+    mirrorCentral(project.repositories)
+}
