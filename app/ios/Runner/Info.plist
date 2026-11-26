@@ -35,6 +35,9 @@
 	<string>https://doorbell-companion.nivadema.workers.dev</string>
 	<key>DoorbellCompanionAPNSEnvironment</key>
 	<string>$(DOORBELL_COMPANION_APNS_ENVIRONMENT)</string>
+	<!-- WebRTC uses standard encryption. Revisit this setting before distributing in France. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Find and connect to Home Assistant and your doorbell on your local network.</string>
 	<key>NSBonjourServices</key>
