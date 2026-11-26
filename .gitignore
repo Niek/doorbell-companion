@@ -1,4 +1,5 @@
 .DS_Store
+/.codex-attachments/
 app/android/local.properties
 worker/.env
 worker/.dev.vars
