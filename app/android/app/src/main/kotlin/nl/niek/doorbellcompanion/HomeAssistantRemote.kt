@@ -618,9 +618,14 @@ class HomeAssistantRemote(
                 MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
                 RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
             )
+            val audioDirection = if (HomeAssistantAuth.supportsTwoWayAudio(context, cameraEntityId)) {
+                RtpTransceiver.RtpTransceiverDirection.SEND_RECV
+            } else {
+                RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+            }
             audioTransceiver = connection.addTransceiver(
                 MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+                RtpTransceiver.RtpTransceiverInit(audioDirection)
             )
 
             timing?.mark("ha_create_offer")

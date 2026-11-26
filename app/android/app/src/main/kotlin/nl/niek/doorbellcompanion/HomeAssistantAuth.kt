@@ -511,7 +511,14 @@ object HomeAssistantAuth {
             ?.takeIf { it.isNotBlank() && it != "null" }
             ?.let(::normalizeBaseUrl)
             ?.takeIf { !it.equals(baseUrl, ignoreCase = true) }
-            ?.let { editor.putString("ha_internal_url", it) }
+            ?.let { advertised ->
+                val existingInternal = getInternalUrl(context)
+                val existingIsIp = existingInternal != null && !existingInternal.contains(".local", ignoreCase = true)
+                val advertisedIsLocal = advertised.contains(".local", ignoreCase = true)
+                if (!(existingIsIp && advertisedIsLocal)) {
+                    editor.putString("ha_internal_url", advertised)
+                }
+            }
 
         configResult?.optString("external_url")
             ?.takeIf { it.isNotBlank() && it != "null" }

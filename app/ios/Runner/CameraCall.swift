@@ -111,12 +111,8 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     try Task.checkCancellation()
     try await connection.setLocalDescription(offer)
     try Task.checkCancellation()
-    let latestSdp = connection.localDescription?.sdp.isEmpty == false ? connection.localDescription!.sdp : offer.sdp
-    if latestSdp.contains("a=candidate:") {
-      localCandidates.removeAll { latestSdp.contains($0.sdp) }
-    }
     mark("local_sdp_ready")
-    return (connection, latestSdp)
+    return (connection, offer.sdp)
   }
 
   private func connect() async throws {
@@ -177,8 +173,12 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData)
     }
 
+    let latestSdp = connection.localDescription?.sdp.isEmpty == false ? connection.localDescription!.sdp : offerSdp
+    if latestSdp.contains("a=candidate:") {
+      localCandidates.removeAll { latestSdp.contains($0.sdp) }
+    }
     let offerID = try await socket.sendCommand("camera/webrtc/offer", fields: [
-      "entity_id": bell.camera, "offer": offerSdp,
+      "entity_id": bell.camera, "offer": latestSdp,
     ])
     mark("offer_sent")
 

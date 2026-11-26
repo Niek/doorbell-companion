@@ -306,7 +306,12 @@ class CallActivity : Activity() {
         timing?.mark("activity_new_intent")
         doorbellName = intent.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() }
             ?: HomeAssistantAuth.prefs(this).getString("last_doorbell_name", doorbellName) ?: doorbellName
+        val incomingCamera = intent.getStringExtra("camera_entity_id")
         if (intent.getBooleanExtra("answer", false)) {
+            if (!incomingCamera.isNullOrBlank() && incomingCamera != activeCameraEntityId) {
+                releaseWebRtcView()
+                startHomeAssistantCamera(incomingCamera)
+            }
             answerCall()
         } else {
             releaseAudio()
@@ -318,7 +323,7 @@ class CallActivity : Activity() {
             muteBtn.update(R.drawable.ic_mic, "Mute")
             dismiss.update(R.drawable.ic_call_end, "Decline")
             releaseWebRtcView()
-            startHomeAssistantCamera(intent.getStringExtra("camera_entity_id"))
+            startHomeAssistantCamera(incomingCamera)
         }
     }
 

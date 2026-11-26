@@ -20,6 +20,7 @@ import UIKit
   private var testPushTask: Task<Void, Never>?
   private var pushSetupError: String?
   private var pushReady = false
+  private var didRefreshOnLaunch = false
 
   override func application(
     _ application: UIApplication,
@@ -33,13 +34,6 @@ import UIKit
     calls.tokenChanged = { [weak self] in self?.syncPush() }
     calls.registerForVoIP()
     discovery.didChange = { [weak self] in self?.channel?.invokeMethod("onDiscoveredInstances", arguments: $0) }
-    if home.url != nil, !home.pendingDisconnect {
-      Task { [weak self] in
-        guard let self else { return }
-        try? await self.home.refreshDoorbells()
-        self.publishStatus()
-      }
-    }
     return launched
   }
 
@@ -57,6 +51,14 @@ import UIKit
   func sceneBecameActive() {
     calls.showCameraIfReady()
     publishStatus()
+    if !didRefreshOnLaunch, home.url != nil, !home.pendingDisconnect {
+      didRefreshOnLaunch = true
+      Task { [weak self] in
+        guard let self else { return }
+        try? await self.home.refreshDoorbells()
+        self.publishStatus()
+      }
+    }
   }
 
   private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
