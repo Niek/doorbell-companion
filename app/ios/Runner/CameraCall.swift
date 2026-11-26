@@ -2,13 +2,19 @@ import AVFoundation
 import UIKit
 import WebRTC
 
+private final class NoOpVideoEncoderFactory: NSObject, RTCVideoEncoderFactory {
+  func createEncoder(_ info: RTCVideoCodecInfo) -> (any RTCVideoEncoder)? { nil }
+  func supportedCodecs() -> [RTCVideoCodecInfo] { [] }
+}
+
 @MainActor
 final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   let bell: Doorbell
   private let home: HomeAssistant
   private let audioReady: () -> Bool
   private static let factory = RTCPeerConnectionFactory(
-    encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: RTCDefaultVideoDecoderFactory()
+    encoderFactory: NoOpVideoEncoderFactory(),
+    decoderFactory: RTCDefaultVideoDecoderFactory()
   )
   private var connection: RTCPeerConnection?
   private var socket: HASocket?
@@ -22,22 +28,36 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   private var microphone: RTCAudioTrack?
   private var acceptsAudio = false
   private var answered = false
-  private var muted = false
+  private(set) var muted = false
   private let startedAt = ProcessInfo.processInfo.systemUptime
   private var firstFrameLogged = false
   private(set) var video: RTCVideoTrack?
   private(set) var snapshot: UIImage?
   private(set) var status = "Connecting camera…"
   private(set) var canMute = false
-  var isNegotiated: Bool { remoteDescriptionSet }
   var didChange: (() -> Void)?
   var didFail: ((Error) -> Void)?
-  var didNegotiate: (() -> Void)?
 
-  init(bell: Doorbell, home: HomeAssistant, audioReady: @escaping () -> Bool) {
+  static func warmUp() {
+    DispatchQueue.global(qos: .utility).async {
+      _ = Self.factory
+    }
+  }
+
+  init(
+    bell: Doorbell,
+    home: HomeAssistant,
+    audioReady: @escaping () -> Bool,
+    workerTimeMs: Int64? = nil,
+    eventTimeMs: Int64? = nil
+  ) {
     self.bell = bell
     self.home = home
     self.audioReady = audioReady
+    super.init()
+    let wallMs = Int64(Date().timeIntervalSince1970 * 1000)
+    NSLog("Doorbell Companion timing: push_received elapsed_ms=0 wall_ms=%lld event_ms=%lld worker_ms=%lld",
+          wallMs, eventTimeMs ?? 0, workerTimeMs ?? 0)
   }
 
   func start() {
@@ -56,42 +76,13 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     }
   }
 
-  private func connect() async throws {
-    try Task.checkCancellation()
-    let endpoints = home.endpoints
-    let tokenTask = Task { [home] in try await home.accessToken() }
-    defer { tokenTask.cancel() }
-    snapshotTask = Task { [weak self] in
-      guard let self, let token = try? await tokenTask.value, !Task.isCancelled else { return }
-      let data = await withTaskGroup(of: Data?.self, returning: Data?.self) { group in
-        for endpoint in endpoints {
-          group.addTask { @MainActor [home = self.home, bell = self.bell] in
-            try? await home.snapshot(at: endpoint, camera: bell.camera, token: token)
-          }
-        }
-        for await candidate in group {
-          if let candidate {
-            group.cancelAll()
-            return candidate
-          }
-        }
-        return nil
-      }
-      guard !Task.isCancelled, let data, let image = UIImage(data: data) else { return }
-      snapshot = image
-      mark("snapshot_ready")
-      didChange?()
-    }
-    let socket = try await firstAuthorizedSocket(endpoints: endpoints, tokenTask: tokenTask)
-    self.socket = socket
-    try Task.checkCancellation()
-
-    let config = try await socket.command("camera/webrtc/get_client_config", fields: [
-      "entity_id": bell.camera,
-    ]) as? JSON
+  private func buildPeerAndOffer(iceServers serverData: [JSON]) async throws -> (RTCPeerConnection, String) {
     let configuration = RTCConfiguration()
     configuration.sdpSemantics = .unifiedPlan
-    let serverData = (config?["configuration"] as? JSON)?["iceServers"] as? [JSON] ?? []
+    configuration.bundlePolicy = .maxBundle
+    configuration.rtcpMuxPolicy = .require
+    configuration.continualGatheringPolicy = .gatherContinually
+    configuration.iceCandidatePoolSize = 1
     configuration.iceServers = serverData.compactMap {
       let urls = $0["urls"] as? [String] ?? ($0["urls"] as? String).map { [$0] } ?? []
       guard !urls.isEmpty else { return nil }
@@ -99,7 +90,9 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
                           credential: $0["credential"] as? String)
     }
     if configuration.iceServers.isEmpty {
-      configuration.iceServers = [RTCIceServer(urlStrings: ["stun:stun.home-assistant.io:3478"])]
+      configuration.iceServers = [
+        RTCIceServer(urlStrings: ["stun:stun.home-assistant.io:3478", "stun:stun.cloudflare.com:3478"]),
+      ]
     }
     let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
     guard let connection = Self.factory.peerConnection(with: configuration, constraints: constraints,
@@ -118,13 +111,88 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     try Task.checkCancellation()
     try await connection.setLocalDescription(offer)
     try Task.checkCancellation()
-    let id = try await socket.sendCommand("camera/webrtc/offer", fields: [
-      "entity_id": bell.camera, "offer": offer.sdp,
+    let latestSdp = connection.localDescription?.sdp.isEmpty == false ? connection.localDescription!.sdp : offer.sdp
+    if latestSdp.contains("a=candidate:") {
+      localCandidates.removeAll { latestSdp.contains($0.sdp) }
+    }
+    mark("local_sdp_ready")
+    return (connection, latestSdp)
+  }
+
+  private func connect() async throws {
+    try Task.checkCancellation()
+    let endpoints = home.endpoints
+    let tokenTask = Task { [home] in try await home.accessToken() }
+    defer { tokenTask.cancel() }
+
+    snapshotTask = Task { [weak self] in
+      guard let self, let token = try? await tokenTask.value, !Task.isCancelled else { return }
+      let data = await withTaskGroup(of: Data?.self, returning: Data?.self) { group in
+        for endpoint in endpoints {
+          group.addTask { @MainActor [home = self.home, bell = self.bell] in
+            try? await home.snapshot(at: endpoint, camera: bell.camera, token: token)
+          }
+        }
+        for await candidate in group {
+          if let candidate {
+            group.cancelAll()
+            return candidate
+          }
+        }
+        return nil
+      }
+      guard !Task.isCancelled, !firstFrameLogged, let data, let image = UIImage(data: data) else { return }
+      snapshot = image
+      mark("snapshot_ready")
+      didChange?()
+    }
+
+    // Overlap PeerConnection + offer creation with WebSocket connect when ICE servers are cached.
+    let cachedIce = home.cachedICEServers()
+    let prebuiltOffer: Task<(RTCPeerConnection, String), Error>? = cachedIce.map { servers in
+      Task { try await self.buildPeerAndOffer(iceServers: servers) }
+    }
+    defer { prebuiltOffer?.cancel() }
+
+    let socket = try await home.firstAuthorizedSocket(endpoints: endpoints, tokenTask: tokenTask)
+    self.socket = socket
+    try Task.checkCancellation()
+    mark("ha_auth_ok")
+
+    let connection: RTCPeerConnection
+    let offerSdp: String
+    var configCommandID: Int?
+    if let prebuiltOffer {
+      (connection, offerSdp) = try await prebuiltOffer.value
+      // Refresh ICE cache in the background while the offer is already in flight.
+      configCommandID = try? await socket.sendCommand("camera/webrtc/get_client_config", fields: [
+        "entity_id": bell.camera,
+      ])
+    } else {
+      let config = try await socket.command("camera/webrtc/get_client_config", fields: [
+        "entity_id": bell.camera,
+      ]) as? JSON
+      let serverData = (config?["configuration"] as? JSON)?["iceServers"] as? [JSON] ?? []
+      home.saveICEServers(serverData)
+      (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData)
+    }
+
+    let offerID = try await socket.sendCommand("camera/webrtc/offer", fields: [
+      "entity_id": bell.camera, "offer": offerSdp,
     ])
     mark("offer_sent")
+
     while !Task.isCancelled {
       let message = try await socket.receive()
-      guard message["id"] as? Int == id else { continue }
+      let msgID = message["id"] as? Int
+      if let configCommandID, msgID == configCommandID, message["type"] as? String == "result" {
+        if let result = message["result"] as? JSON,
+           let servers = (result["configuration"] as? JSON)?["iceServers"] as? [JSON] {
+          home.saveICEServers(servers)
+        }
+        continue
+      }
+      guard msgID == offerID else { continue }
       if message["type"] as? String == "result" && message["success"] as? Bool == false {
         throw DoorbellCompanionError("Home Assistant rejected the WebRTC offer")
       }
@@ -132,6 +200,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       switch event["type"] as? String {
       case "session":
         sessionID = event["session_id"] as? String
+        mark("ha_session")
         let candidates = localCandidates
         localCandidates.removeAll()
         for candidate in candidates { try await sendCandidate(candidate) }
@@ -144,7 +213,6 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         for candidate in remoteCandidates { try await connection.add(candidate) }
         remoteCandidates.removeAll()
         mark("remote_description_set")
-        didNegotiate?()
         updateMicrophone()
       case "candidate":
         guard let data = event["candidate"] as? JSON, let sdp = data["candidate"] as? String,
@@ -160,58 +228,6 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         break
       }
     }
-  }
-
-  private func firstAuthorizedSocket(endpoints: [URL], tokenTask: Task<String, Error>) async throws -> HASocket {
-    enum Attempt {
-      case endpoint(HASocket?)
-      case timeout
-    }
-    let socket = await withTaskGroup(of: Attempt.self, returning: HASocket?.self) { group in
-      for endpoint in endpoints {
-        group.addTask { @MainActor [home] in
-          let socket = try? await home.authorizedSocket(at: endpoint) { try await tokenTask.value }
-          if Task.isCancelled {
-            socket?.close()
-            return .endpoint(nil)
-          }
-          return .endpoint(socket)
-        }
-      }
-      group.addTask {
-        try? await Task.sleep(nanoseconds: 8_000_000_000)
-        return .timeout
-      }
-      var pending = endpoints.count
-      while let result = await group.next() {
-        switch result {
-        case .endpoint(.some(let socket)):
-          group.cancelAll()
-          // Close any other authenticated socket whose result was already queued.
-          for await other in group {
-            if case .endpoint(let loser) = other { loser?.close() }
-          }
-          return socket
-        case .endpoint(nil):
-          pending -= 1
-          if pending > 0 { continue }
-        case .timeout:
-          break
-        }
-        group.cancelAll()
-        for await other in group {
-          if case .endpoint(let loser) = other { loser?.close() }
-        }
-        break
-      }
-      return nil
-    }
-    if Task.isCancelled {
-      socket?.close()
-      throw CancellationError()
-    }
-    guard let socket else { throw DoorbellCompanionError("Home Assistant WebSocket is unreachable") }
-    return socket
   }
 
   private func sendCandidate(_ candidate: RTCIceCandidate) async throws {
@@ -257,15 +273,16 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     didChange?()
   }
 
-  func toggleMute() -> Bool {
-    muted.toggle()
+  func setMuted(_ next: Bool) {
+    guard muted != next else { return }
+    muted = next
     updateMicrophone()
-    return muted
   }
 
   func close() {
     connectionTask?.cancel()
     snapshotTask?.cancel()
+    snapshot = nil
     socket?.close()
     connection?.close()
     microphone?.isEnabled = false
@@ -273,12 +290,14 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     socket = nil
     didChange = nil
     didFail = nil
-    didNegotiate = nil
   }
 
   func renderedFirstFrame() {
     guard !firstFrameLogged else { return }
     firstFrameLogged = true
+    snapshotTask?.cancel()
+    snapshotTask = nil
+    snapshot = nil
     mark("first_frame")
   }
 
@@ -332,6 +351,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
 @MainActor
 final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   private let call: CameraCall
+  private let toggleMuteAction: () -> Void
   private let endCall: () -> Void
   private let video = RTCMTLVideoView()
   private let snapshot = UIImageView()
@@ -344,8 +364,9 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   private var fillsScreen = true
   private var live = false
 
-  init(call: CameraCall, endCall: @escaping () -> Void) {
+  init(call: CameraCall, toggleMute: @escaping () -> Void, endCall: @escaping () -> Void) {
     self.call = call
+    self.toggleMuteAction = toggleMute
     self.endCall = endCall
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .fullScreen
@@ -408,9 +429,7 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
     header.spacing = 10
 
     muteButton.addAction(UIAction { [weak self] _ in
-      guard let self else { return }
-      let muted = call.toggleMute()
-      muteButton.update(symbol: muted ? "mic.slash.fill" : "mic.fill", title: muted ? "Unmute" : "Mute")
+      self?.toggleMuteAction()
     }, for: .touchUpInside)
     let endButton = CallControl(symbol: "phone.down.fill", title: "End", color: .systemRed)
     endButton.addAction(UIAction { [weak self] _ in self?.endCall() }, for: .touchUpInside)
@@ -472,7 +491,11 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
     live = call.status == "Live"
     statusDot.backgroundColor = live ? .systemGreen : .systemOrange
     muteButton.isHidden = !call.canMute
-    snapshot.image = call.snapshot
+    muteButton.update(symbol: call.muted ? "mic.slash.fill" : "mic.fill",
+                      title: call.muted ? "Unmute" : "Mute")
+    if !snapshot.isHidden {
+      snapshot.image = call.snapshot
+    }
     if track !== call.video {
       track?.remove(video)
       track = call.video
@@ -484,6 +507,7 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
     guard size.width > 0, size.height > 0 else { return }
     Task { @MainActor [weak self] in
       self?.snapshot.isHidden = true
+      self?.snapshot.image = nil
       self?.call.renderedFirstFrame()
     }
   }

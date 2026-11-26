@@ -8,6 +8,10 @@ struct DoorbellCompanionError: LocalizedError {
   init(_ message: String) { errorDescription = message }
 }
 
+struct HAAuthRejectedError: LocalizedError {
+  var errorDescription: String? { "Home Assistant rejected the session" }
+}
+
 struct HAHTTPError: LocalizedError {
   let status: Int
   let path: String
@@ -77,8 +81,8 @@ final class HomeAssistant {
   var pendingDisconnect: Bool { credentials?.pendingRevocation != nil }
   var endpoints: [URL] {
     var urls = [localURL, externalURL, url].compactMap { $0 }
-    var seen = Set<URL>()
-    urls.removeAll { !seen.insert($0).inserted }
+    var seen = Set<String>()
+    urls.removeAll { !seen.insert($0.absoluteString.lowercased()).inserted }
     return urls
   }
   var name: String { "Doorbell Companion iOS \(deviceID)" }
@@ -100,7 +104,7 @@ final class HomeAssistant {
     registrationServer = defaults.url(forKey: "registration_server")
   }
 
-  static func serverURL(_ raw: String) throws -> URL {
+  nonisolated static func serverURL(_ raw: String) throws -> URL {
     let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     var components = URLComponents(string: value.contains("://") ? value : "https://\(value)")
     guard let scheme = components?.scheme?.lowercased(), ["http", "https"].contains(scheme),
@@ -112,6 +116,32 @@ final class HomeAssistant {
     while components?.path.hasSuffix("/") == true { components?.path.removeLast() }
     guard let url = components?.url else { throw DoorbellCompanionError("Invalid Home Assistant URL") }
     return url
+  }
+
+  func saveLocalURL(_ candidate: URL?) {
+    guard let candidate, candidate.absoluteString.lowercased() != url?.absoluteString.lowercased() else { return }
+    localURL = candidate
+    defaults.set(candidate, forKey: "local_url")
+  }
+
+  func cachedICEServers() -> [JSON]? {
+    guard let data = defaults.data(forKey: "ice_servers"),
+          let servers = (try? JSONSerialization.jsonObject(with: data)) as? [JSON],
+          !servers.isEmpty else { return nil }
+    let raw = String(decoding: data, as: UTF8.self)
+    let hasTurn = raw.contains("\"credential\"") || raw.contains("turn:") || raw.contains("turns:")
+    if hasTurn {
+      let savedAt = defaults.double(forKey: "ice_servers_time")
+      if Date().timeIntervalSince1970 - savedAt >= 6 * 60 * 60 { return nil }
+    }
+    return servers
+  }
+
+  func saveICEServers(_ servers: [JSON]) {
+    guard !servers.isEmpty,
+          let data = try? JSONSerialization.data(withJSONObject: servers) else { return }
+    defaults.set(data, forKey: "ice_servers")
+    defaults.set(Date().timeIntervalSince1970, forKey: "ice_servers_time")
   }
 
   func signIn(at url: URL, with code: String, verifier: String) async throws {
@@ -133,6 +163,8 @@ final class HomeAssistant {
       externalURL = nil
       defaults.removeObject(forKey: "local_url")
       defaults.removeObject(forKey: "external_url")
+      defaults.removeObject(forKey: "ice_servers")
+      defaults.removeObject(forKey: "ice_servers_time")
     }
     credentials = value
     if registrationServer != url {
@@ -140,13 +172,14 @@ final class HomeAssistant {
       registeredPushToken = nil
       defaults.removeObject(forKey: "registration")
       defaults.removeObject(forKey: "registered_push_token")
+      defaults.removeObject(forKey: "synced_doorbell_subscription")
     }
   }
 
   func accessToken(forceRefresh: Bool = false) async throws -> String {
     if let refreshTask { return try await refreshTask.value }
     guard let credentials else { throw DoorbellCompanionError("Sign in to Home Assistant first") }
-    if !forceRefresh && credentials.expiration.timeIntervalSinceNow > 30 {
+    if !forceRefresh && credentials.expiration.timeIntervalSinceNow > 120 {
       return credentials.accessToken
     }
     let candidates = endpoints
@@ -199,7 +232,11 @@ final class HomeAssistant {
       let access = try await token()
       try Task.checkCancellation()
       try await socket.send(["type": "auth", "access_token": access])
-      guard try await socket.receive()["type"] as? String == "auth_ok" else {
+      let responseType = try await socket.receive()["type"] as? String
+      if responseType == "auth_invalid" {
+        throw HAAuthRejectedError()
+      }
+      guard responseType == "auth_ok" else {
         throw DoorbellCompanionError("Home Assistant rejected the camera session")
       }
       return socket
@@ -209,40 +246,157 @@ final class HomeAssistant {
     }
   }
 
-  func refreshDoorbells() async throws {
-    let token = try await accessToken()
-    var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
-    for endpoint in endpoints {
-      do {
-        let socket = try await authorizedSocket(at: endpoint, token: token)
-        defer { socket.close() }
-        let devices = try await socket.command("config/device_registry/list") as? [JSON] ?? []
-        let entities = try await socket.command("config/entity_registry/list") as? [JSON] ?? []
-        let states = try await socket.command("get_states") as? [JSON] ?? []
-        let config = try await socket.command("get_config") as? JSON ?? [:]
-        let disabled = Set(doorbells.filter { !$0.enabled }.map(\.camera))
-        var discovered = Self.discoverDoorbells(devices: devices, entities: entities, states: states,
-                                                version: config["version"] as? String)
-        for index in discovered.indices {
-          let result = try? await socket.command("camera/capabilities", fields: [
-            "entity_id": discovered[index].camera,
-          ]) as? JSON
-          discovered[index].talkback = result?["two_way_audio"] as? Bool == true
-          discovered[index].enabled = !disabled.contains(discovered[index].camera)
+  /// Races all known endpoints in parallel and retries once with a force-refreshed token if HA rejects auth.
+  func firstAuthorizedSocket(endpoints: [URL], tokenTask: Task<String, Error>? = nil) async throws -> HASocket {
+    do {
+      let resolvedTokenTask = tokenTask ?? Task { [self] in try await self.accessToken() }
+      return try await raceAuthorizedSockets(endpoints: endpoints, tokenTask: resolvedTokenTask)
+    } catch is HAAuthRejectedError {
+      let refreshed = try await accessToken(forceRefresh: true)
+      let retryTask = Task<String, Error> { refreshed }
+      return try await raceAuthorizedSockets(endpoints: endpoints, tokenTask: retryTask)
+    }
+  }
+
+  private func raceAuthorizedSockets(endpoints: [URL], tokenTask: Task<String, Error>) async throws -> HASocket {
+    enum Attempt {
+      case connected(HASocket)
+      case authRejected
+      case failed
+      case timeout
+    }
+    let outcome: Attempt = await withTaskGroup(of: Attempt.self) { group in
+      for endpoint in endpoints {
+        group.addTask { @MainActor [self] in
+          do {
+            let socket = try await self.authorizedSocket(at: endpoint) { try await tokenTask.value }
+            if Task.isCancelled {
+              socket.close()
+              return .failed
+            }
+            return .connected(socket)
+          } catch is HAAuthRejectedError {
+            return .authRejected
+          } catch {
+            return .failed
+          }
         }
-        doorbells = discovered
-        saveDoorbells()
-        localURL = (config["internal_url"] as? String).flatMap { try? Self.serverURL($0) } ?? localURL
-        externalURL = (config["external_url"] as? String).flatMap { try? Self.serverURL($0) }
-        defaults.set(localURL, forKey: "local_url")
-        defaults.set(externalURL, forKey: "external_url")
-        return
-      } catch {
-        try Task.checkCancellation()
-        lastError = error
+      }
+      group.addTask {
+        try? await Task.sleep(nanoseconds: 8_000_000_000)
+        return .timeout
+      }
+      var pending = endpoints.count
+      var sawAuthRejected = false
+      while let result = await group.next() {
+        switch result {
+        case .connected(let socket):
+          group.cancelAll()
+          for await other in group {
+            if case .connected(let loser) = other { loser.close() }
+          }
+          return .connected(socket)
+        case .authRejected:
+          sawAuthRejected = true
+          pending -= 1
+          if pending > 0 { continue }
+        case .failed:
+          pending -= 1
+          if pending > 0 { continue }
+        case .timeout:
+          break
+        }
+        group.cancelAll()
+        for await other in group {
+          if case .connected(let loser) = other { loser.close() }
+        }
+        return sawAuthRejected ? .authRejected : .failed
+      }
+      return sawAuthRejected ? .authRejected : .failed
+    }
+    if Task.isCancelled {
+      if case .connected(let socket) = outcome { socket.close() }
+      throw CancellationError()
+    }
+    switch outcome {
+    case .connected(let socket):
+      return socket
+    case .authRejected:
+      throw HAAuthRejectedError()
+    case .failed, .timeout:
+      throw DoorbellCompanionError("Home Assistant WebSocket is unreachable")
+    }
+  }
+
+  func refreshDoorbells() async throws {
+    let socket = try await firstAuthorizedSocket(endpoints: endpoints)
+    defer { socket.close() }
+
+    // Phase 1: fetch registries, states, and config in a single pipelined RTT.
+    let phase1 = try await socket.pipeline([
+      (type: "config/device_registry/list", fields: [:], required: true),
+      (type: "config/entity_registry/list", fields: [:], required: true),
+      (type: "get_states", fields: [:], required: true),
+      (type: "get_config", fields: [:], required: true),
+    ])
+    let devices = phase1[0] as? [JSON] ?? []
+    let entities = phase1[1] as? [JSON] ?? []
+    let states = phase1[2] as? [JSON] ?? []
+    let config = phase1[3] as? JSON ?? [:]
+
+    let disabled = Set(doorbells.filter { !$0.enabled }.map(\.camera))
+    var discovered = Self.discoverDoorbells(devices: devices, entities: entities, states: states,
+                                            version: config["version"] as? String)
+
+    // Phase 2: disable preload_stream (faster IDR keyframe on Protect), warm ICE config, and read capabilities.
+    if !discovered.isEmpty {
+      var phase2Requests: [(type: String, fields: JSON, required: Bool)] = []
+      for bell in discovered {
+        phase2Requests.append((
+          type: "camera/update_prefs",
+          fields: ["entity_id": bell.camera, "preload_stream": false],
+          required: false
+        ))
+      }
+      let iceIndex = phase2Requests.count
+      phase2Requests.append((
+        type: "camera/webrtc/get_client_config",
+        fields: ["entity_id": discovered[0].camera],
+        required: false
+      ))
+      let capStartIndex = phase2Requests.count
+      for bell in discovered {
+        phase2Requests.append((
+          type: "camera/capabilities",
+          fields: ["entity_id": bell.camera],
+          required: false
+        ))
+      }
+
+      let phase2 = try await socket.pipeline(phase2Requests)
+      if let iceConfig = phase2[iceIndex] as? JSON,
+         let servers = (iceConfig["configuration"] as? JSON)?["iceServers"] as? [JSON] {
+        saveICEServers(servers)
+      }
+      for index in discovered.indices {
+        let cap = phase2[capStartIndex + index] as? JSON
+        discovered[index].talkback = cap?["two_way_audio"] as? Bool == true
+        discovered[index].enabled = !disabled.contains(discovered[index].camera)
       }
     }
-    throw lastError
+
+    doorbells = discovered
+    saveDoorbells()
+    if let advertisedInternal = (config["internal_url"] as? String).flatMap({ try? Self.serverURL($0) }) {
+      let existingIsIP = localURL?.host.map { !$0.lowercased().hasSuffix(".local") } == true
+      let advertisedIsLocal = advertisedInternal.host?.lowercased().hasSuffix(".local") == true
+      if !(existingIsIP && advertisedIsLocal) {
+        localURL = advertisedInternal
+      }
+    }
+    externalURL = (config["external_url"] as? String).flatMap { try? Self.serverURL($0) }
+    defaults.set(localURL, forKey: "local_url")
+    defaults.set(externalURL, forKey: "external_url")
   }
 
   static func discoverDoorbells(devices: [JSON], entities: [JSON], states: [JSON],
@@ -300,7 +454,9 @@ final class HomeAssistant {
     if result.isEmpty {
       result = (cameras.values.flatMap { $0 } + standalone).compactMap { entity in
         guard let camera = entity["entity_id"] as? String else { return nil }
-        return Doorbell(camera: camera, name: friendlyNames[camera] ?? camera, triggers: [])
+        let device = entity["device_id"] as? String
+        let name = device.flatMap { names[$0] } ?? friendlyNames[camera] ?? camera
+        return Doorbell(camera: camera, name: name, triggers: [])
       }
     }
     return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -347,7 +503,7 @@ final class HomeAssistant {
       "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "1.0",
       "os_version": ProcessInfo.processInfo.operatingSystemVersionString, "app_data": appData,
     ]
-    if let registration = deviceRegistration, registeredPushToken != pushToken {
+    if let registration = deviceRegistration, registeredPushToken != pushToken || force {
       do {
         _ = try await request(at: endpoint, path: "api/webhook/\(registration)", json: [
           "type": "update_registration", "data": deviceInfo,
@@ -481,8 +637,9 @@ final class HomeAssistant {
     deviceRegistration = nil
     registeredPushToken = nil
     registrationServer = nil
-    for key in ["doorbells", "local_url", "external_url", "synced_doorbell_subscription", "registration",
-                "registered_push_token", "registration_server"] {
+    for key in ["doorbells", "local_url", "external_url", "ice_servers", "ice_servers_time",
+                "synced_doorbell_subscription", "registration", "registered_push_token",
+                "registration_server"] {
       defaults.removeObject(forKey: key)
     }
   }
@@ -553,18 +710,32 @@ final class HomeAssistant {
     return false
   }
 
+  /// Races all deduplicated endpoints in parallel so cellular doesn't wait for a dead LAN timeout.
   private func reachableEndpoint(token: String) async throws -> URL {
-    var lastError: Error = DoorbellCompanionError("Home Assistant is unreachable")
-    for endpoint in [url, localURL, externalURL].compactMap({ $0 }) {
-      do {
-        _ = try await request(at: endpoint, path: "api/", token: token)
-        return endpoint
-      } catch {
-        try Task.checkCancellation()
-        lastError = error
-      }
+    let candidates = endpoints
+    guard !candidates.isEmpty else { throw DoorbellCompanionError("Home Assistant is unreachable") }
+    if candidates.count == 1 {
+      _ = try await request(at: candidates[0], path: "api/", token: token)
+      return candidates[0]
     }
-    throw lastError
+    let winner = await withTaskGroup(of: URL?.self, returning: URL?.self) { group in
+      for endpoint in candidates {
+        group.addTask { @MainActor [self] in
+          guard (try? await self.request(at: endpoint, path: "api/", token: token)) != nil else { return nil }
+          return endpoint
+        }
+      }
+      for await result in group {
+        if let result {
+          group.cancelAll()
+          return result
+        }
+      }
+      return nil
+    }
+    try Task.checkCancellation()
+    guard let winner else { throw DoorbellCompanionError("Home Assistant is unreachable") }
+    return winner
   }
 
   func snapshot(at endpoint: URL, camera: String, token: String) async throws -> Data {
@@ -684,16 +855,34 @@ final class HASocket {
   }
 
   func command(_ type: String, fields: JSON = [:]) async throws -> Any? {
-    let id = try await sendCommand(type, fields: fields)
-    while !Task.isCancelled {
-      let message = try await receive()
-      guard message["type"] as? String == "result", message["id"] as? Int == id else { continue }
-      guard message["success"] as? Bool == true else {
-        throw DoorbellCompanionError("Home Assistant rejected \(type)")
-      }
-      return message["result"]
+    let results = try await pipeline([(type: type, fields: fields, required: true)])
+    return results.first ?? nil
+  }
+
+  /// Sends all commands immediately and collects their results in a single RTT.
+  func pipeline(_ requests: [(type: String, fields: JSON, required: Bool)]) async throws -> [Any?] {
+    guard !requests.isEmpty else { return [] }
+    var idToIndex: [Int: Int] = [:]
+    for (index, req) in requests.enumerated() {
+      let id = try await sendCommand(req.type, fields: req.fields)
+      idToIndex[id] = index
     }
-    throw CancellationError()
+    var results = Array<Any?>(repeating: nil, count: requests.count)
+    var remaining = idToIndex.count
+    while remaining > 0 {
+      try Task.checkCancellation()
+      let message = try await receive()
+      guard message["type"] as? String == "result",
+            let id = message["id"] as? Int,
+            let index = idToIndex.removeValue(forKey: id) else { continue }
+      remaining -= 1
+      if message["success"] as? Bool == true {
+        results[index] = message["result"]
+      } else if requests[index].required {
+        throw DoorbellCompanionError("Home Assistant rejected \(requests[index].type)")
+      }
+    }
+    return results
   }
 
   func sendCommand(_ type: String, fields: JSON) async throws -> Int {

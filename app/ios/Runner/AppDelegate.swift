@@ -1,6 +1,7 @@
 import AuthenticationServices
 import AVFoundation
 import CryptoKit
+import Darwin
 import Flutter
 import UIKit
 
@@ -14,6 +15,7 @@ import UIKit
   private var authentication: ASWebAuthenticationSession?
   private var oauthState: String?
   private var syncTask: Task<Void, Never>?
+  private var debouncedSyncTask: Task<Void, Never>?
   private var disconnecting = false
   private var testPushTask: Task<Void, Never>?
   private var pushSetupError: String?
@@ -24,9 +26,20 @@ import UIKit
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     let launched = super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    CameraCall.warmUp()
+    if home.pendingDisconnect {
+      pushSetupError = "Run Disconnect again to finish signing out of Home Assistant"
+    }
     calls.tokenChanged = { [weak self] in self?.syncPush() }
     calls.registerForVoIP()
     discovery.didChange = { [weak self] in self?.channel?.invokeMethod("onDiscoveredInstances", arguments: $0) }
+    if home.url != nil, !home.pendingDisconnect {
+      Task { [weak self] in
+        guard let self else { return }
+        try? await self.home.refreshDoorbells()
+        self.publishStatus()
+      }
+    }
     return launched
   }
 
@@ -77,7 +90,12 @@ import UIKit
     case "setDoorbellEnabled":
       if let camera = arguments["cameraEntityId"] as? String, let enabled = arguments["enabled"] as? Bool {
         home.setEnabled(camera, enabled)
-        syncPush()
+        debouncedSyncTask?.cancel()
+        debouncedSyncTask = Task { [weak self] in
+          try? await Task.sleep(nanoseconds: 400_000_000)
+          guard !Task.isCancelled else { return }
+          self?.syncPush()
+        }
       }
       result(status())
     case "disconnect":
@@ -89,6 +107,7 @@ import UIKit
       Task {
         defer { disconnecting = false }
         do {
+          debouncedSyncTask?.cancel()
           testPushTask?.cancel()
           await syncTask?.value
           try await home.disconnect()
@@ -98,6 +117,7 @@ import UIKit
         } catch {
           if home.pendingDisconnect {
             pushReady = false
+            pushSetupError = "Run Disconnect again to finish signing out of Home Assistant"
             publishStatus()
           }
           result(flutterError(error))
@@ -118,7 +138,10 @@ import UIKit
       }
       sendTestPush(bell: bell, result: result)
     case "openUrl":
-      if let raw = arguments["url"] as? String, let url = URL(string: raw), url.scheme == "https" {
+      if let raw = arguments["url"] as? String,
+         let url = URL(string: raw),
+         let scheme = url.scheme?.lowercased(),
+         scheme == "https" || scheme == "http" {
         UIApplication.shared.open(url)
       }
       result(nil)
@@ -247,12 +270,14 @@ import UIKit
 
   private func finishAuthentication(at endpoint: URL, code: String, verifier: String) async {
     channel?.invokeMethod("onOAuthProgress", arguments: "Finding Home Assistant doorbells…")
+    let discoveredLocalURL = discovery.internalURL(for: endpoint.absoluteString)
     do {
       try await home.signIn(at: endpoint, with: code, verifier: verifier)
     } catch {
       channel?.invokeMethod("onOAuthError", arguments: error.localizedDescription)
       return
     }
+    home.saveLocalURL(discoveredLocalURL)
     discovery.stop()
     pushSetupError = nil
     do { try await home.refreshDoorbells() }
@@ -286,14 +311,25 @@ import UIKit
 }
 
 final class HomeAssistantDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+  private struct Entry {
+    let name: String
+    let url: String
+    let version: String
+    let internalURL: URL?
+  }
+
   private let browser = NetServiceBrowser()
   private var services: [NetService] = []
-  private var instances: [JSON] = []
+  private var entriesByService: [String: Entry] = [:]
   private var isBrowsing = false
   var didChange: (([JSON]) -> Void)?
 
+  func internalURL(for primaryURL: String) -> URL? {
+    entriesByService.values.first { $0.url.caseInsensitiveCompare(primaryURL) == .orderedSame }?.internalURL
+  }
+
   func start() {
-    didChange?(instances)
+    publish()
     guard !isBrowsing else { return }
     isBrowsing = true
     browser.delegate = self
@@ -304,7 +340,7 @@ final class HomeAssistantDiscovery: NSObject, NetServiceBrowserDelegate, NetServ
     browser.stop()
     for service in services { service.stop() }
     services.removeAll()
-    instances.removeAll()
+    entriesByService.removeAll()
     isBrowsing = false
   }
 
@@ -314,24 +350,78 @@ final class HomeAssistantDiscovery: NSObject, NetServiceBrowserDelegate, NetServ
     service.resolve(withTimeout: 5)
   }
 
+  func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
+    services.removeAll { $0 == service }
+    if entriesByService.removeValue(forKey: service.name) != nil {
+      publish()
+    }
+  }
+
   func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
     isBrowsing = false
   }
 
   func netServiceDidResolveAddress(_ service: NetService) {
-    guard let host = service.hostName, service.port > 0 else { return }
+    guard service.port > 0 else { return }
     let values = service.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
     func value(_ name: String) -> String? {
-      values[name].flatMap { String(data: $0, encoding: .utf8) }
+      values[name].flatMap { String(data: $0, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .flatMap { $0.isEmpty ? nil : $0 }
     }
-    var endpoint = URLComponents()
-    endpoint.scheme = "http"
-    endpoint.host = host.hasSuffix(".") ? String(host.dropLast()) : host
-    endpoint.port = service.port
-    guard let url = value("internal_url").flatMap(URL.init(string:)) ?? endpoint.url else { return }
-    guard !instances.contains(where: { $0["url"] as? String == url.absoluteString }) else { return }
-    instances.append(["name": value("location_name") ?? service.name,
-                      "url": url.absoluteString, "version": value("version") ?? ""])
-    didChange?(instances)
+
+    let resolvedIP = Self.ipv4Address(from: service.addresses)
+    let fallbackHost = resolvedIP ?? service.hostName?.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    let fallbackLocal = fallbackHost.flatMap { URL(string: "http://\($0):\(service.port)") }
+
+    let externalURL = value("external_url").flatMap { try? HomeAssistant.serverURL($0) }
+    let txtInternal = value("internal_url").flatMap { try? HomeAssistant.serverURL($0) }
+    let baseURL = value("base_url").flatMap { try? HomeAssistant.serverURL($0) }
+
+    // Prefer resolved numeric IP over http://*.local to skip per-connection mDNS lookup latency.
+    let internalURL: URL?
+    if let txtInternal, txtInternal.scheme?.lowercased() == "http",
+       txtInternal.host?.lowercased().hasSuffix(".local") == true, let fallbackLocal {
+      internalURL = fallbackLocal
+    } else {
+      internalURL = txtInternal ?? fallbackLocal
+    }
+
+    // Prefer external_url as primary so doorbell calls keep working remotely on cellular,
+    // while keeping internalURL for low-latency LAN racing on Wi-Fi.
+    guard let chosenURL = externalURL ?? baseURL ?? internalURL else { return }
+    entriesByService[service.name] = Entry(
+      name: value("location_name") ?? service.name,
+      url: chosenURL.absoluteString,
+      version: value("version") ?? "",
+      internalURL: internalURL
+    )
+    publish()
+  }
+
+  private func publish() {
+    var seen = Set<String>()
+    let list: [JSON] = entriesByService.values.compactMap { entry in
+      guard seen.insert(entry.url.lowercased()).inserted else { return nil }
+      return ["name": entry.name, "url": entry.url, "version": entry.version]
+    }
+    didChange?(list)
+  }
+
+  private static func ipv4Address(from addresses: [Data]?) -> String? {
+    guard let addresses else { return nil }
+    for data in addresses {
+      var ip: String?
+      data.withUnsafeBytes { raw in
+        guard let addr = raw.baseAddress?.assumingMemoryBound(to: sockaddr.self),
+              addr.pointee.sa_family == sa_family_t(AF_INET) else { return }
+        var sin = raw.load(as: sockaddr_in.self)
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        if inet_ntop(AF_INET, &sin.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+          ip = String(cString: buffer)
+        }
+      }
+      if let ip { return ip }
+    }
+    return nil
   }
 }

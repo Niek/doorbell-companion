@@ -49,7 +49,7 @@ class AppStatus {
     this.notificationsGranted = true,
     this.microphoneGranted = false,
     this.fullScreenGranted = true,
-    this.pushReady,
+    this.pushReady = false,
     this.pushError,
   });
 
@@ -59,7 +59,7 @@ class AppStatus {
   final bool notificationsGranted;
   final bool microphoneGranted;
   final bool fullScreenGranted;
-  final bool? pushReady;
+  final bool pushReady;
   final String? pushError;
 
   int get enabledCount => doorbells.where((d) => d.enabled).length;
@@ -76,7 +76,7 @@ class AppStatus {
       notificationsGranted: map['notificationsGranted'] != false,
       microphoneGranted: map['microphoneGranted'] == true,
       fullScreenGranted: map['fullScreenGranted'] != false,
-      pushReady: map['pushReady'] as bool?,
+      pushReady: map['pushReady'] == true,
       pushError: map['pushError'] as String?,
     );
   }
@@ -90,25 +90,34 @@ class DoorbellCompanionController extends ChangeNotifier {
 
   static const _channel = MethodChannel('doorbell_companion');
 
+  bool loaded = false;
   AppStatus status = const AppStatus();
   List<DiscoveredInstance> discovered = const [];
   String? oauthProgress;
   String? oauthError;
-  String? oauthUrl;
   bool refreshing = false;
   bool disconnecting = false;
+  bool _discoveryActive = false;
+
   /// Camera whose test ring is scheduled, if any.
   String? testPushCamera;
+
+  void _applyStatus(Map<Object?, Object?> raw) {
+    loaded = true;
+    status = AppStatus.fromMap(raw);
+    if (status.haConnected) {
+      _discoveryActive = false;
+    } else if (!_discoveryActive) {
+      startDiscovery();
+    }
+    notifyListeners();
+  }
 
   Future<dynamic> _handleNativeCall(MethodCall call) async {
     switch (call.method) {
       case 'onStatusChanged':
         final raw = call.arguments as Map<Object?, Object?>?;
-        if (raw != null) {
-          status = AppStatus.fromMap(raw);
-          if (!status.haConnected) startDiscovery();
-          notifyListeners();
-        }
+        if (raw != null) _applyStatus(raw);
       case 'onDiscoveredInstances':
         final raw = call.arguments as List<Object?>?;
         if (raw != null) {
@@ -122,19 +131,20 @@ class DoorbellCompanionController extends ChangeNotifier {
       case 'onOAuthProgress':
         oauthProgress = call.arguments as String?;
         oauthError = null;
-        oauthUrl = null;
         notifyListeners();
       case 'onOAuthComplete':
         oauthProgress = null;
         oauthError = null;
-        oauthUrl = null;
         final raw = call.arguments as Map<Object?, Object?>?;
-        if (raw != null) status = AppStatus.fromMap(raw);
-        notifyListeners();
+        if (raw != null) {
+          _applyStatus(raw);
+        } else {
+          notifyListeners();
+        }
       case 'onOAuthError':
         oauthProgress = null;
         oauthError = (call.arguments as String?) ?? 'Connection failed';
-        oauthUrl = null;
+        _discoveryActive = false;
         startDiscovery();
         notifyListeners();
     }
@@ -143,40 +153,41 @@ class DoorbellCompanionController extends ChangeNotifier {
   Future<void> refreshStatus() async {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>('getStatus');
-      if (raw != null) {
-        status = AppStatus.fromMap(raw);
-        if (!status.haConnected) startDiscovery();
+      if (raw != null) _applyStatus(raw);
+    } catch (_) {
+      if (!loaded) {
+        loaded = true;
         notifyListeners();
       }
-    } catch (_) {}
+    }
   }
 
   Future<void> startDiscovery() async {
+    _discoveryActive = true;
     try {
       await _channel.invokeMethod('startDiscovery');
-    } catch (_) {}
+    } catch (_) {
+      _discoveryActive = false;
+    }
   }
 
-  Future<void> startOAuth(String url, {bool local = false}) async {
+  Future<void> startOAuth(String url) async {
     url = url.trim();
     if (url.isEmpty) return;
     oauthError = null;
-    oauthUrl = local ? null : url;
     oauthProgress = 'Continue in browser…';
     notifyListeners();
     try {
-      await _channel.invokeMethod('startOAuth', {'url': url, 'local': local});
+      await _channel.invokeMethod('startOAuth', {'url': url});
     } on PlatformException catch (e) {
       oauthProgress = null;
       oauthError = e.message ?? 'Invalid URL';
-      oauthUrl = null;
       notifyListeners();
     }
   }
 
   Future<void> cancelOAuth() async {
     oauthProgress = null;
-    oauthUrl = null;
     notifyListeners();
     try {
       await _channel.invokeMethod('cancelOAuth');
@@ -189,10 +200,7 @@ class DoorbellCompanionController extends ChangeNotifier {
         'cameraEntityId': cameraEntityId,
         'enabled': enabled,
       });
-      if (raw != null) {
-        status = AppStatus.fromMap(raw);
-        notifyListeners();
-      }
+      if (raw != null) _applyStatus(raw);
       return null;
     } on PlatformException catch (e) {
       return e.message ?? 'Could not update the doorbell';
@@ -204,7 +212,7 @@ class DoorbellCompanionController extends ChangeNotifier {
     notifyListeners();
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>('refreshDoorbells');
-      if (raw != null) status = AppStatus.fromMap(raw);
+      if (raw != null) _applyStatus(raw);
       return null;
     } on PlatformException catch (e) {
       return e.message ?? 'Could not refresh doorbells';
@@ -219,10 +227,14 @@ class DoorbellCompanionController extends ChangeNotifier {
     notifyListeners();
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>('disconnect');
-      if (raw != null) status = AppStatus.fromMap(raw);
       discovered = const [];
       oauthError = null;
-      await startDiscovery();
+      _discoveryActive = false;
+      if (raw != null) {
+        _applyStatus(raw);
+      } else {
+        await startDiscovery();
+      }
       return null;
     } on PlatformException catch (e) {
       return e.message ?? 'Could not disconnect';
@@ -257,6 +269,7 @@ class DoorbellCompanionController extends ChangeNotifier {
   }
 
   Future<void> openUrl(String url) async {
+    if (url.isEmpty) return;
     try {
       await _channel.invokeMethod('openUrl', {'url': url});
     } catch (_) {}
@@ -268,7 +281,6 @@ class DoorbellCompanionController extends ChangeNotifier {
     } catch (_) {}
   }
 }
-
 
 const _brandBlue = Color(0xFF2F6BFF);
 
@@ -348,6 +360,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: widget.controller,
     builder: (context, _) {
+      if (!widget.controller.loaded) {
+        return const Scaffold();
+      }
       final st = widget.controller.status;
       return Scaffold(
         appBar: st.haConnected
@@ -499,11 +514,6 @@ class _OnboardingBody extends StatelessWidget {
               const SizedBox(height: 20),
               Text(progress, style: theme.textTheme.titleMedium, textAlign: TextAlign.center),
               const SizedBox(height: 16),
-              if (theme.platform == TargetPlatform.android && controller.oauthUrl != null)
-                TextButton(
-                  onPressed: () => controller.startOAuth(controller.oauthUrl!, local: true),
-                  child: const Text('Use local sign-in'),
-                ),
               TextButton(
                 onPressed: controller.cancelOAuth,
                 child: const Text('Cancel'),
@@ -614,14 +624,21 @@ class _StatusHero extends StatelessWidget {
     final scheme = theme.colorScheme;
     final total = status.doorbells.length;
     final active = status.enabledCount;
-    final ready = active > 0;
+    final ready = active > 0 && status.pushReady;
+    final String title;
     final String detail;
     if (total == 0) {
+      title = 'Doorbell calls paused';
       detail = 'No doorbells found yet';
-    } else if (ready) {
-      detail = '$active of $total ${total == 1 ? 'doorbell' : 'doorbells'} will ring this phone';
-    } else {
+    } else if (active == 0) {
+      title = 'Doorbell calls paused';
       detail = 'All doorbells are turned off in Settings';
+    } else if (!status.pushReady) {
+      title = status.pushError != null ? 'Doorbell calls paused' : 'Setting up doorbell calls…';
+      detail = '$active of $total ${total == 1 ? 'doorbell' : 'doorbells'} selected';
+    } else {
+      title = 'Ready for doorbell calls';
+      detail = '$active of $total ${total == 1 ? 'doorbell' : 'doorbells'} will ring this phone';
     }
     final fg = ready ? scheme.onPrimaryContainer : scheme.onSurfaceVariant;
 
@@ -634,10 +651,7 @@ class _StatusHero extends StatelessWidget {
           children: [
             Icon(ready ? Icons.doorbell : Icons.notifications_paused_outlined, size: 36, color: fg),
             const SizedBox(height: 16),
-            Text(
-              ready ? 'Ready for doorbell calls' : 'Doorbell calls paused',
-              style: theme.textTheme.titleLarge?.copyWith(color: fg),
-            ),
+            Text(title, style: theme.textTheme.titleLarge?.copyWith(color: fg)),
             const SizedBox(height: 4),
             Text(detail, style: theme.textTheme.bodyMedium?.copyWith(color: fg)),
             const SizedBox(height: 4),
@@ -668,7 +682,7 @@ class _ConnectedBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final st = controller.status;
     final enabled = st.doorbells.where((d) => d.enabled).toList();
-    final canRing = st.pushReady != false && controller.testPushCamera == null;
+    final canRing = st.pushReady && controller.testPushCamera == null;
 
     return RefreshIndicator(
       onRefresh: () => _refresh(context),
@@ -696,12 +710,12 @@ class _ConnectedBody extends StatelessWidget {
               onTap: () => controller.requestPermission('fullScreen'),
             ),
           ],
-          if (st.pushReady == false) ...[
+          if (!st.pushReady) ...[
             const SizedBox(height: 12),
             _Banner(
-              icon: Icons.phone_iphone,
+              icon: Icons.phonelink_ring_outlined,
               title: st.pushError != null ? 'Call registration failed' : 'Registering for calls…',
-              message: st.pushError ?? 'Waiting for Apple push registration.',
+              message: st.pushError ?? 'Waiting for push registration.',
               error: st.pushError != null,
               onTap: st.pushError != null ? () => _refresh(context) : null,
             ),
@@ -840,7 +854,7 @@ class SettingsScreen extends StatelessWidget {
           icon: const Icon(Icons.logout),
           title: const Text('Disconnect Home Assistant?'),
           content: const Text(
-            'This removes the ring automation and phone registration from Home Assistant and revokes this phone’s sign-in session.',
+            'This removes this phone’s doorbell subscriptions and Mobile App registration from Home Assistant and revokes its sign-in session. The shared automation stays active for other phones.',
           ),
           actions: [
             TextButton(
@@ -876,6 +890,7 @@ class SettingsScreen extends StatelessWidget {
       final theme = Theme.of(context);
       final scheme = theme.colorScheme;
       final st = controller.status;
+      final isAndroid = theme.platform == TargetPlatform.android;
 
       return Scaffold(
         appBar: AppBar(
@@ -926,7 +941,7 @@ class SettingsScreen extends StatelessWidget {
                                 final err = await controller.setDoorbellEnabled(db.cameraEntityId, val);
                                 if (err != null && context.mounted) _showMessage(context, err);
                               },
-                        secondary: Icon(Icons.doorbell_outlined),
+                        secondary: const Icon(Icons.doorbell_outlined),
                         title: Text(db.name),
                         subtitle: Text(
                           db.cameraEntityId.replaceFirst('camera.', ''),
@@ -946,7 +961,7 @@ class SettingsScreen extends StatelessWidget {
               const _SectionHeader('Permissions'),
               _DividedCard(
                 children: [
-                  if (st.pushReady == null) ...[
+                  if (isAndroid) ...[
                     _PermissionTile(
                       icon: Icons.notifications_outlined,
                       title: 'Notifications',
@@ -981,14 +996,16 @@ class SettingsScreen extends StatelessWidget {
                     leading: const Icon(Icons.open_in_new),
                     title: const Text('Open Home Assistant'),
                     trailing: const Icon(Icons.chevron_right),
-                    onTap: () => controller.openUrl('https://my.home-assistant.io/redirect/config/'),
+                    onTap: () => controller.openUrl(st.haUrl),
                   ),
                   ListTile(
                     leading: controller.disconnecting
                         ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
                         : const Icon(Icons.logout),
-                    title: Text(controller.disconnecting ? 'Disconnecting…' : 'Disconnect',
-                        style: TextStyle(color: scheme.error)),
+                    title: Text(
+                      controller.disconnecting ? 'Disconnecting…' : 'Disconnect',
+                      style: TextStyle(color: scheme.error),
+                    ),
                     onTap: controller.disconnecting ? null : () => _confirmDisconnect(context),
                   ),
                 ],

@@ -4,8 +4,11 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
@@ -18,13 +21,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
-import android.content.res.ColorStateList
-import android.graphics.Typeface
-import android.graphics.drawable.RippleDrawable
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.window.OnBackInvokedDispatcher
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
@@ -124,6 +125,12 @@ class CallActivity : Activity() {
         remoteVideo.requestLayout()
     }
 
+    private fun dismissCall() {
+        HomeAssistantPrewarm.cancel()
+        RingNotification.stop(this)
+        finish()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         callStart = SystemClock.elapsedRealtime()
@@ -148,6 +155,11 @@ class CallActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 28) {
             window.attributes = window.attributes.apply {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) {
+                dismissCall()
             }
         }
 
@@ -221,11 +233,7 @@ class CallActivity : Activity() {
             )
         }
 
-        dismiss = CallButton(R.drawable.ic_call_end, "Decline", Color.parseColor("#E5383B")) {
-            HomeAssistantPrewarm.cancel()
-            RingNotification.stop(this@CallActivity)
-            finish()
-        }
+        dismiss = CallButton(R.drawable.ic_call_end, "Decline", Color.parseColor("#E5383B")) { dismissCall() }
         muteBtn = CallButton(R.drawable.ic_mic, "Mute", Color.argb(110, 255, 255, 255)) { toggleMute() }.apply {
             visibility = View.GONE
         }
@@ -301,11 +309,14 @@ class CallActivity : Activity() {
         if (intent.getBooleanExtra("answer", false)) {
             answerCall()
         } else {
+            releaseAudio()
+            answered = false
             title.text = doorbellName
+            setStatus("Connecting camera…")
             answer.visibility = View.VISIBLE
             muteBtn.visibility = View.GONE
+            muteBtn.update(R.drawable.ic_mic, "Mute")
             dismiss.update(R.drawable.ic_call_end, "Decline")
-            answered = false
             releaseWebRtcView()
             startHomeAssistantCamera(intent.getStringExtra("camera_entity_id"))
         }
@@ -426,30 +437,60 @@ class CallActivity : Activity() {
         muteBtn.update(if (next) R.drawable.ic_mic_off else R.drawable.ic_mic, if (next) "Unmute" else "Mute")
     }
 
+    private fun configureCallAudio(audio: AudioManager) {
+        val focusReq = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .build()
+        audioFocusRequest = focusReq
+        audio.requestAudioFocus(focusReq)
+        audio.mode = AudioManager.MODE_IN_COMMUNICATION
+        if (Build.VERSION.SDK_INT >= 31) {
+            val devices = audio.availableCommunicationDevices
+            val preferredHeadset = devices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
+            val target = preferredHeadset ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            if (target != null) audio.setCommunicationDevice(target)
+        } else {
+            val hasExternalAudio = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
+            @Suppress("DEPRECATION")
+            audio.isSpeakerphoneOn = !hasExternalAudio
+        }
+    }
+
+    private fun releaseAudio() {
+        if (!answered && audioFocusRequest == null) return
+        val audio = getSystemService(AudioManager::class.java)
+        if (Build.VERSION.SDK_INT >= 31) {
+            audio.clearCommunicationDevice()
+        } else {
+            @Suppress("DEPRECATION")
+            audio.isSpeakerphoneOn = false
+        }
+        audio.mode = AudioManager.MODE_NORMAL
+        audioFocusRequest?.let { audio.abandonAudioFocusRequest(it) }
+        audioFocusRequest = null
+    }
+
     private fun answerCall() {
         RingNotification.stop(this)
         if (!answered) {
-            val audio = getSystemService(AudioManager::class.java)
-            val focusReq = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .build()
-            audioFocusRequest = focusReq
-            audio.requestAudioFocus(focusReq)
-            audio.mode = AudioManager.MODE_IN_COMMUNICATION
-            if (Build.VERSION.SDK_INT >= 31) {
-                val speaker = audio.availableCommunicationDevices.firstOrNull {
-                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                }
-                if (speaker != null) audio.setCommunicationDevice(speaker)
-            } else {
-                @Suppress("DEPRECATION")
-                audio.isSpeakerphoneOn = true
-            }
+            configureCallAudio(getSystemService(AudioManager::class.java))
             answered = true
             timing?.mark("answered")
         }
@@ -474,26 +515,17 @@ class CallActivity : Activity() {
 
     override fun onDestroy() {
         timing?.mark("activity_destroyed")
-        releaseWebRtcView()
-        if (answered) {
-            val audio = getSystemService(AudioManager::class.java)
-            if (Build.VERSION.SDK_INT >= 31) {
-                audio.clearCommunicationDevice()
-            } else {
-                @Suppress("DEPRECATION")
-                audio.isSpeakerphoneOn = false
-            }
-            audio.mode = AudioManager.MODE_NORMAL
-            audioFocusRequest?.let { audio.abandonAudioFocusRequest(it) }
-            audioFocusRequest = null
+        if (isFinishing) {
+            RingNotification.stop(this)
+            if (!answered) HomeAssistantPrewarm.cancel()
         }
+        releaseWebRtcView()
+        releaseAudio()
         super.onDestroy()
     }
 
     @Deprecated("Deprecated in Android")
     override fun onBackPressed() {
-        HomeAssistantPrewarm.cancel()
-        RingNotification.stop(this)
-        super.onBackPressed()
+        dismissCall()
     }
 }

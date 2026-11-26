@@ -11,6 +11,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.os.Build
@@ -20,6 +21,7 @@ import android.os.Looper
 import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
@@ -63,6 +65,7 @@ object RingNotification {
     private const val CHANNEL = "doorbell_calls"
     private const val LOOP_CHANNEL = "doorbell_calls_looping"
     const val ID = 1
+    const val RING_TIMEOUT_MS = 30_000L
     @Volatile private var channelsCreated = false
 
     fun createChannel(context: Context) {
@@ -156,6 +159,14 @@ class RingtoneService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun vibrator(): Vibrator =
+        if (Build.VERSION.SDK_INT >= 31) {
+            getSystemService(VibratorManager::class.java).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Vibrator::class.java)
+        }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val doorbellName = intent?.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() } ?: "Doorbell"
         val cameraEntityId = intent?.getStringExtra("camera_entity_id")?.takeIf { it.isNotBlank() }
@@ -163,9 +174,10 @@ class RingtoneService : Service() {
 
         // Auto-stop unanswered rings so sound/vibration never loop indefinitely.
         main.removeCallbacks(autoStopRunnable)
-        main.postDelayed(autoStopRunnable, 40_000L)
+        main.postDelayed(autoStopRunnable, RingNotification.RING_TIMEOUT_MS)
 
-        if (player == null) {
+        val ringerMode = getSystemService(AudioManager::class.java).ringerMode
+        if (player == null && ringerMode == AudioManager.RINGER_MODE_NORMAL) {
             val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
             if (uri != null) {
                 try {
@@ -188,14 +200,14 @@ class RingtoneService : Service() {
                 }
             }
         }
-        if (!vibrating) {
-            val vibrator = getSystemService(Vibrator::class.java)
+        if (!vibrating && ringerMode != AudioManager.RINGER_MODE_SILENT) {
+            val vib = vibrator()
             val effect = VibrationEffect.createWaveform(longArrayOf(0, 700, 800), 0)
             if (Build.VERSION.SDK_INT >= 33) {
-                vibrator.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_RINGTONE))
+                vib.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_RINGTONE))
             } else {
                 @Suppress("DEPRECATION")
-                vibrator.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).build())
+                vib.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).build())
             }
             vibrating = true
         }
@@ -206,7 +218,7 @@ class RingtoneService : Service() {
         main.removeCallbacks(autoStopRunnable)
         player?.release()
         player = null
-        getSystemService(Vibrator::class.java).cancel()
+        vibrator().cancel()
         super.onDestroy()
     }
 }

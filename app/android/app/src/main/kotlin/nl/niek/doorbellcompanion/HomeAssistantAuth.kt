@@ -2,6 +2,7 @@ package nl.niek.doorbellcompanion
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import io.flutter.FlutterInjector
@@ -19,6 +20,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -36,11 +38,12 @@ data class DoorbellInfo(
 )
 
 object HomeAssistantAuth {
-    const val FALLBACK_CLIENT_ID = "https://doorbell-companion.nivadema.workers.dev"
-    const val ANDROID_CLIENT_ID = "$FALLBACK_CLIENT_ID/android"
-    const val PUSH_RELAY_URL = "https://doorbell-companion.nivadema.workers.dev/push"
+    const val RELAY_BASE_URL = "https://doorbell-companion.nivadema.workers.dev"
+    const val ANDROID_CLIENT_ID = "$RELAY_BASE_URL/android"
+    const val PUSH_RELAY_URL = "$RELAY_BASE_URL/push"
     private const val PREFS = "doorbell_companion"
     private const val PENDING_REVOCATION = "ha_pending_revocation"
+    private const val SYNCED_SUBSCRIPTION = "ha_synced_subscription"
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val nonAlnum = Regex("[^a-z0-9]+")
 
@@ -66,6 +69,18 @@ object HomeAssistantAuth {
             !p.getString("ha_refresh_token", null).isNullOrBlank()
     }
 
+    fun isPendingDisconnect(context: Context): Boolean =
+        prefs(context).contains(PENDING_REVOCATION)
+
+    fun isPushSynced(context: Context): Boolean {
+        val p = prefs(context)
+        return !p.contains(PENDING_REVOCATION) &&
+            !p.getString("ha_webhook_id", null).isNullOrBlank() &&
+            !p.getString("ha_notify_service", null).isNullOrBlank() &&
+            p.getString("ha_push_url", null) == PUSH_RELAY_URL &&
+            !p.getString("fcm_token", null).isNullOrBlank()
+    }
+
     fun getBaseUrl(context: Context): String? = prefs(context).getString("ha_url", null)
 
     fun getInternalUrl(context: Context): String? {
@@ -74,6 +89,14 @@ object HomeAssistantAuth {
         val external = p.getString("ha_url", null)?.trimEnd('/')
         return internal.trimEnd('/').takeIf { !it.equals(external, ignoreCase = true) }
     }
+
+    fun getExternalUrl(context: Context): String? =
+        prefs(context).getString("ha_external_url", null)?.takeIf { it.isNotBlank() }?.trimEnd('/')
+
+    /** Deduplicated Home Assistant endpoints ordered LAN-first, then external, then primary sign-in URL. */
+    fun endpoints(context: Context): List<String> =
+        listOfNotNull(getInternalUrl(context), getExternalUrl(context), getBaseUrl(context)?.trimEnd('/'))
+            .distinctBy { it.lowercase() }
 
     fun saveInternalUrl(context: Context, rawUrl: String?) {
         val normalized = rawUrl?.trim()?.takeIf { it.isNotBlank() && it != "null" }
@@ -87,20 +110,15 @@ object HomeAssistantAuth {
         val p = prefs(context)
         val baseUrl = p.getString("ha_url", null) ?: return@synchronized
         val refresh = p.getString("ha_refresh_token", null) ?: error("Home Assistant sign-in credentials are missing")
-        val endpoints = listOfNotNull(getInternalUrl(context), baseUrl).distinct()
+        val candidates = endpoints(context).ifEmpty { listOf(baseUrl) }
         var endpoint = p.getString(PENDING_REVOCATION, null)
         if (endpoint == null) {
             val token = getAccessToken(context, forceRefresh = true)
                 ?: error("Could not verify your Home Assistant sign-in. Check the connection and try again.")
-            endpoint = endpoints.firstOrNull { url ->
-                try {
-                    cleanupCall(haRequest(url, token, "/api/").build()).use { it.isSuccessful }
-                } catch (_: IOException) {
-                    false
-                }
-            } ?: error("Could not reach Home Assistant. Check the connection and try again.")
+            endpoint = firstReachableEndpoint(candidates, token)
+                ?: error("Could not reach Home Assistant. Check the connection and try again.")
 
-            val entryId = registrationEntryId(endpoint, token, p.getString("ha_webhook_id", null))
+            val entryId = registrationEntryId(context, endpoint, token, p.getString("ha_webhook_id", null))
             if (entryId != null) {
                 deleteRegistration(endpoint, token, entryId)
             }
@@ -108,7 +126,7 @@ object HomeAssistantAuth {
             check(p.edit().putString(PENDING_REVOCATION, endpoint).commit()) { "Could not save disconnect progress" }
         }
 
-        check((listOf(endpoint) + endpoints).distinct().any { revokeSession(it, refresh) }) {
+        check((listOf(endpoint) + candidates).distinct().any { revokeSession(it, refresh) }) {
             "Could not revoke the Home Assistant session. Check the connection and try Disconnect again."
         }
 
@@ -118,27 +136,28 @@ object HomeAssistantAuth {
             p.edit()
                 .remove("ha_url")
                 .remove("ha_internal_url")
+                .remove("ha_external_url")
                 .remove("ha_client_id")
-                .remove("ha_llat")
                 .remove("ha_access_token")
                 .remove("ha_refresh_token")
                 .remove("ha_token_expires_at")
                 .remove("ha_doorbells")
                 .remove("ha_disabled_cameras")
-                .remove("ha_default_camera")
                 .remove("ha_ice_servers")
                 .remove("ha_ice_servers_time")
                 .remove("ha_notify_service")
                 .remove("ha_webhook_id")
                 .remove("ha_push_url")
-                .remove("ha_two_way_audio")
                 .remove("ha_two_way_cameras")
+                .remove("ha_registered_push_token")
+                .remove("ha_legacy_device")
+                .remove(SYNCED_SUBSCRIPTION)
                 .remove(PENDING_REVOCATION)
                 .apply()
         }
     }
 
-    private fun registrationEntryId(endpoint: String, token: String, webhookId: String?): String? {
+    private fun registrationEntryId(context: Context, endpoint: String, token: String, webhookId: String?): String? {
         val deviceId = webhookId?.let { id ->
             val request = Request.Builder().url("$endpoint/api/webhook/$id")
                 .post(JSONObject().put("type", "get_config").toString().toRequestBody(jsonMedia))
@@ -159,12 +178,13 @@ object HomeAssistantAuth {
                 error("Could not verify the phone registration. Check the connection and try again.")
             }
         }
+        val expectedRegId = registrationDeviceId(context)
         val devices = registeredDevices(endpoint, token)
         val matching = (0 until devices.length()).mapNotNull { devices.optJSONObject(it) }.filter { device ->
             val identifiers = device.optJSONArray("identifiers") ?: return@filter false
             (0 until identifiers.length()).any {
                 val identifier = identifiers.optJSONArray(it)
-                identifier?.optString(0) == "mobile_app" && identifier.optString(1) == registrationDeviceId()
+                identifier?.optString(0) == "mobile_app" && identifier.optString(1) == expectedRegId
             }
         }
         if (deviceId == null && matching.isEmpty()) return null
@@ -228,6 +248,49 @@ object HomeAssistantAuth {
         timeout().timeout(8, TimeUnit.SECONDS)
     }.execute()
 
+    /** Races all candidate endpoints in parallel and returns the first that responds OK to `/api/`. */
+    private fun firstReachableEndpoint(endpoints: List<String>, token: String): String? {
+        if (endpoints.isEmpty()) return null
+        if (endpoints.size == 1) {
+            val only = endpoints.first()
+            return try {
+                cleanupCall(haRequest(only, token, "/api/").build()).use { if (it.isSuccessful) only else null }
+            } catch (_: IOException) {
+                null
+            }
+        }
+        val winner = AtomicReference<String?>(null)
+        val pending = AtomicInteger(endpoints.size)
+        val done = CountDownLatch(1)
+        val calls = endpoints.map { url ->
+            val call = httpClient.newCall(haRequest(url, token, "/api/").build()).apply {
+                timeout().timeout(8, TimeUnit.SECONDS)
+            }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (pending.decrementAndGet() == 0) done.countDown()
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use {
+                            if (it.isSuccessful && winner.compareAndSet(null, url)) done.countDown()
+                        }
+                    } finally {
+                        if (pending.decrementAndGet() == 0) done.countDown()
+                    }
+                }
+            })
+            call
+        }
+        return try {
+            done.await(8, TimeUnit.SECONDS)
+            winner.get()
+        } finally {
+            calls.forEach { it.cancel() }
+        }
+    }
+
     fun normalizeBaseUrl(raw: String): String {
         var trimmed = raw.trim()
         if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
@@ -245,27 +308,13 @@ object HomeAssistantAuth {
         }
     }
 
-    fun supportsPkce(baseUrl: String): Boolean = try {
-        val request = Request.Builder().url("$baseUrl/.well-known/oauth-authorization-server").build()
-        val call = httpClient.newCall(request)
-        call.timeout().timeout(2, TimeUnit.SECONDS)
-        call.execute().use { response ->
-            val methods = if (response.isSuccessful) {
-                JSONObject(response.body?.string().orEmpty()).optJSONArray("code_challenge_methods_supported")
-            } else null
-            methods != null && (0 until methods.length()).any { methods.optString(it) == "S256" }
-        }
-    } catch (_: Exception) {
-        false
-    }
-
-    fun exchangeCode(context: Context, baseUrl: String, code: String, clientId: String, verifier: String?): Boolean {
+    fun exchangeCode(context: Context, baseUrl: String, code: String, clientId: String, verifier: String): Boolean {
         val cleanUrl = normalizeBaseUrl(baseUrl)
         val form = FormBody.Builder()
             .add("grant_type", "authorization_code")
             .add("code", code)
             .add("client_id", clientId)
-            .apply { if (verifier != null) add("code_verifier", verifier) }
+            .add("code_verifier", verifier)
             .build()
         val req = Request.Builder().url("$cleanUrl/auth/token").post(form).build()
         var lastError: Exception? = null
@@ -283,9 +332,18 @@ object HomeAssistantAuth {
                         cachedToken = access
                         cachedExpiresAt = expiresAt
                         val prefs = prefs(context)
-                        prefs.edit()
-                            .apply { if (prefs.getString("ha_url", null) != cleanUrl) remove("ha_internal_url") }
-                            .remove("ha_llat")
+                        val editor = prefs.edit()
+                        if (prefs.getString("ha_url", null) != cleanUrl) {
+                            editor.remove("ha_internal_url")
+                                .remove("ha_external_url")
+                                .remove("ha_webhook_id")
+                                .remove("ha_registered_push_token")
+                                .remove("ha_notify_service")
+                                .remove("ha_ice_servers")
+                                .remove("ha_ice_servers_time")
+                                .remove(SYNCED_SUBSCRIPTION)
+                        }
+                        editor
                             .putString("ha_url", cleanUrl)
                             .putString("ha_client_id", clientId)
                             .putString("ha_access_token", access)
@@ -327,15 +385,13 @@ object HomeAssistantAuth {
             if (!forceRefresh) {
                 peekAccessToken(context)?.let { return it }
             }
-            val baseUrl = p.getString("ha_url", null) ?: return null
             val refresh = p.getString("ha_refresh_token", null) ?: return null
-            val clientId = p.getString("ha_client_id", FALLBACK_CLIENT_ID) ?: FALLBACK_CLIENT_ID
-            val endpoints = listOfNotNull(getInternalUrl(context), baseUrl).distinct()
-            val refreshed = refreshOAuthToken(endpoints, refresh, clientId) ?: return null
+            val clientId = p.getString("ha_client_id", ANDROID_CLIENT_ID) ?: ANDROID_CLIENT_ID
+            val candidates = endpoints(context)
+            val refreshed = refreshOAuthToken(candidates, refresh, clientId) ?: return null
             cachedToken = refreshed.first
             cachedExpiresAt = refreshed.second
             p.edit()
-                .remove("ha_llat")
                 .putString("ha_access_token", refreshed.first)
                 .putLong("ha_token_expires_at", refreshed.second)
                 .apply()
@@ -394,13 +450,24 @@ object HomeAssistantAuth {
             synchronized(pushLock) {
                 val p = prefs(context)
                 if (p.contains(PENDING_REVOCATION)) return@synchronized
-                val baseUrl = getBaseUrl(context) ?: return@synchronized
                 val webhookId = p.getString("ha_webhook_id", null)?.takeIf { it.isNotBlank() } ?: return@synchronized
                 val pushUrl = p.getString("ha_push_url", null)?.takeIf { it.isNotBlank() } ?: return@synchronized
+                val candidates = endpoints(context)
+                if (candidates.isEmpty()) return@synchronized
                 try {
-                    val ok = updateRegistration(baseUrl, webhookId, pushUrl, newToken)
+                    val ok = candidates.any { endpoint ->
+                        try {
+                            updateRegistration(context, endpoint, webhookId, pushUrl, newToken)
+                        } catch (_: IOException) {
+                            false
+                        }
+                    }
                     Log.i("DoorbellCompanion", "Push token sync via webhook: ok=$ok")
-                    if (!ok) setupPushAutomation(context)
+                    if (ok) {
+                        p.edit().putString("ha_registered_push_token", newToken).apply()
+                    } else {
+                        setupPushAutomation(context)
+                    }
                 } catch (e: Exception) {
                     Log.w("DoorbellCompanion", "Push token sync failed: ${e.message}")
                 }
@@ -409,15 +476,18 @@ object HomeAssistantAuth {
     }
 
     fun discoverDoorbellsAndWarmup(context: Context): List<DoorbellInfo> {
-        val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
+        val candidates = endpoints(context)
+        if (candidates.isEmpty()) error("Home Assistant not configured")
         val p = prefs(context)
         var token = getAccessToken(context) ?: error("Could not authenticate with Home Assistant")
+        val endpoint = firstReachableEndpoint(candidates, token) ?: candidates.first()
 
-        var results = runWarmupSession(baseUrl, token)
+        var results = runWarmupSession(endpoint, token)
         if (results == null) {
             // The cached access token was rejected. Refresh it and retry once.
             token = getAccessToken(context, forceRefresh = true) ?: error("Authentication rejected by Home Assistant")
-            results = runWarmupSession(baseUrl, token)
+            val retryEndpoint = firstReachableEndpoint(candidates, token) ?: endpoint
+            results = runWarmupSession(retryEndpoint, token)
                 ?: error("Authentication rejected by Home Assistant")
         }
 
@@ -434,13 +504,19 @@ object HomeAssistantAuth {
         }
 
         val editor = p.edit().putString("ha_doorbells", arr.toString())
-        doorbells.firstOrNull()?.cameraEntityId?.let { editor.putString("ha_default_camera", it) }
+        val baseUrl = getBaseUrl(context)?.trimEnd('/')
 
-        msgMap[4]?.optJSONObject("result")?.optString("internal_url")
+        val configResult = msgMap[4]?.optJSONObject("result")
+        configResult?.optString("internal_url")
             ?.takeIf { it.isNotBlank() && it != "null" }
             ?.let(::normalizeBaseUrl)
-            ?.takeIf { !it.equals(baseUrl.trimEnd('/'), ignoreCase = true) }
+            ?.takeIf { !it.equals(baseUrl, ignoreCase = true) }
             ?.let { editor.putString("ha_internal_url", it) }
+
+        configResult?.optString("external_url")
+            ?.takeIf { it.isNotBlank() && it != "null" }
+            ?.let(::normalizeBaseUrl)
+            ?.let { editor.putString("ha_external_url", it) }
 
         msgMap[900]?.optJSONObject("result")?.optJSONObject("configuration")?.optJSONArray("iceServers")?.let {
             editor.putString("ha_ice_servers", it.toString())
@@ -453,7 +529,6 @@ object HomeAssistantAuth {
             }
         }
         editor.putStringSet("ha_two_way_cameras", twoWayCameras)
-            .remove("ha_two_way_audio")
         editor.apply()
         return doorbells
     }
@@ -550,10 +625,11 @@ object HomeAssistantAuth {
             }
         })
 
-        latch.await(15, TimeUnit.SECONDS)
+        val completed = latch.await(15, TimeUnit.SECONDS)
         ws.close(1000, null)
         if (authRejected.get()) return null
         errorRef.get()?.let { error(it) }
+        if (!completed && !phase2Started.get()) error("Timed out connecting to Home Assistant")
         return doorbellsRef.get() to results
     }
 
@@ -674,6 +750,9 @@ object HomeAssistantAuth {
     fun supportsTwoWayAudio(context: Context, cameraEntityId: String): Boolean =
         cameraEntityId in (prefs(context).getStringSet("ha_two_way_cameras", emptySet()) ?: emptySet())
 
+    fun hasAnyTwoWayAudio(context: Context): Boolean =
+        !(prefs(context).getStringSet("ha_two_way_cameras", emptySet()).isNullOrEmpty())
+
     /** Returns camera entity IDs explicitly unchecked by the user (empty by default = all selected). */
     fun getDisabledCameraIds(context: Context): Set<String> =
         prefs(context).getStringSet("ha_disabled_cameras", emptySet())?.toSet() ?: emptySet()
@@ -681,11 +760,7 @@ object HomeAssistantAuth {
     fun setDoorbellEnabled(context: Context, cameraEntityId: String, enabled: Boolean) {
         val updated = HashSet(getDisabledCameraIds(context))
         if (enabled) updated.remove(cameraEntityId) else updated.add(cameraEntityId)
-        val editor = prefs(context).edit().putStringSet("ha_disabled_cameras", updated)
-        val all = getSavedDoorbells(context)
-        val firstSelected = all.firstOrNull { it.cameraEntityId !in updated } ?: all.firstOrNull()
-        firstSelected?.let { editor.putString("ha_default_camera", it.cameraEntityId) }
-        editor.apply()
+        prefs(context).edit().putStringSet("ha_disabled_cameras", updated).apply()
     }
 
     fun getEnabledDoorbells(context: Context): List<DoorbellInfo> {
@@ -711,26 +786,56 @@ object HomeAssistantAuth {
         return first?.cameraEntityId to (directName ?: first?.name ?: "Doorbell")
     }
 
+    private fun subscriptionFingerprint(context: Context): String {
+        val routes = sortedMapOf<String, String>()
+        for (db in getEnabledDoorbells(context)) {
+            for (ringEntity in db.ringEntityIds) {
+                routes[ringEntity] = "${db.cameraEntityId}|${db.name}"
+            }
+        }
+        return routes.entries.joinToString(";") { "${it.key}=${it.value}" }
+    }
+
     fun setupPushAutomation(context: Context, refreshTriggers: Boolean = false): String = synchronized(pushLock) {
         val p = prefs(context)
         check(!p.contains(PENDING_REVOCATION)) { "Run Disconnect again to finish signing out of Home Assistant" }
-        val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
+        val candidates = endpoints(context)
+        if (candidates.isEmpty()) error("Home Assistant not configured")
         val fcmToken = p.getString("fcm_token", null)?.takeIf { it.isNotBlank() }
             ?: error("Firebase token not ready yet")
         val pushUrl = PUSH_RELAY_URL
-        val token = getAccessToken(context) ?: error("Not authenticated with Home Assistant")
-
-        val devName = deviceName()
+        val notifyService = "notify.${deviceSlug(context)}"
+        val fingerprint = subscriptionFingerprint(context)
         var webhookId = p.getString("ha_webhook_id", null)
 
-        val updated = !webhookId.isNullOrBlank() && updateRegistration(baseUrl, webhookId, pushUrl, fcmToken)
-        if (!updated) {
+        if (!refreshTriggers &&
+            !webhookId.isNullOrBlank() &&
+            p.getString("ha_push_url", null) == pushUrl &&
+            p.getString("ha_registered_push_token", null) == fcmToken &&
+            p.getString("ha_notify_service", null) == notifyService &&
+            p.getString(SYNCED_SUBSCRIPTION, null) == fingerprint
+        ) {
+            return@synchronized notifyService
+        }
+
+        val token = getAccessToken(context) ?: error("Not authenticated with Home Assistant")
+        val endpoint = firstReachableEndpoint(candidates, token)
+            ?: error("Could not reach Home Assistant")
+
+        val needsTokenUpdate = p.getString("ha_registered_push_token", null) != fcmToken ||
+            p.getString("ha_push_url", null) != pushUrl
+        if (!webhookId.isNullOrBlank() && (needsTokenUpdate || refreshTriggers)) {
+            val ok = updateRegistration(context, endpoint, webhookId, pushUrl, fcmToken)
+            if (!ok) webhookId = null
+        }
+
+        if (webhookId.isNullOrBlank()) {
             val regBody = JSONObject()
-                .put("device_id", registrationDeviceId())
+                .put("device_id", registrationDeviceId(context))
                 .put("app_id", "nl.niek.doorbellcompanion")
                 .put("app_name", "Doorbell Companion")
-                .put("app_version", "1.0.0")
-                .put("device_name", devName)
+                .put("app_version", appVersion(context))
+                .put("device_name", deviceName(context))
                 .put("manufacturer", Build.MANUFACTURER)
                 .put("model", Build.MODEL)
                 .put("os_name", "Android")
@@ -738,7 +843,7 @@ object HomeAssistantAuth {
                 .put("supports_encryption", false)
                 .put("app_data", JSONObject().put("push_url", pushUrl).put("push_token", fcmToken))
 
-            val req = haRequest(baseUrl, token, "/api/mobile_app/registrations")
+            val req = haRequest(endpoint, token, "/api/mobile_app/registrations")
                 .post(regBody.toString().toRequestBody(jsonMedia))
                 .build()
             httpClient.newCall(req).execute().use { resp ->
@@ -751,14 +856,16 @@ object HomeAssistantAuth {
             Thread.sleep(500)
         }
 
-        val notifyService = "notify.${deviceSlug()}"
-        syncSharedAutomation(context, baseUrl, token, refreshTriggers)
+        syncSharedAutomation(context, endpoint, token, refreshTriggers)
         val routes = JSONObject()
         for (db in getEnabledDoorbells(context)) {
             for (ringEntity in db.ringEntityIds) {
-                routes.put(ringEntity, JSONObject()
-                    .put("camera_entity_id", db.cameraEntityId)
-                    .put("doorbell_name", db.name))
+                routes.put(
+                    ringEntity,
+                    JSONObject()
+                        .put("camera_entity_id", db.cameraEntityId)
+                        .put("doorbell_name", db.name)
+                )
             }
         }
         val subscription = JSONObject().put("service", notifyService).put("doorbells", routes)
@@ -770,7 +877,7 @@ object HomeAssistantAuth {
             .put("state", routes.length())
             .put("attributes", JSONObject().put("doorbell_companion_subscription", subscription))
         val command = JSONObject().put("type", "register_sensor").put("data", sensor)
-        val request = Request.Builder().url("$baseUrl/api/webhook/$webhookId")
+        val request = Request.Builder().url("$endpoint/api/webhook/$webhookId")
             .post(command.toString().toRequestBody(jsonMedia)).build()
         httpClient.newCall(request).execute().use { response ->
             val result = runCatching { JSONObject(response.body?.string().orEmpty()) }.getOrNull()
@@ -778,7 +885,12 @@ object HomeAssistantAuth {
                 "Home Assistant could not save this phone's doorbell subscriptions"
             }
         }
-        p.edit().putString("ha_push_url", pushUrl).putString("ha_notify_service", notifyService).apply()
+        p.edit()
+            .putString("ha_push_url", pushUrl)
+            .putString("ha_registered_push_token", fcmToken)
+            .putString("ha_notify_service", notifyService)
+            .putString(SYNCED_SUBSCRIPTION, fingerprint)
+            .apply()
         notifyService
     }
 
@@ -809,8 +921,8 @@ object HomeAssistantAuth {
                     if (ringEntity.startsWith("binary_sensor.")) {
                         trig.put("to", "on")
                     } else {
-                        trig.put("not_from", JSONArray().put("unavailable").put("unknown"))
-                        trig.put("not_to", JSONArray().put("unavailable").put("unknown"))
+                        trig.put("not_from", JSONArray().put("unknown").put("unavailable"))
+                        trig.put("not_to", JSONArray().put("unknown").put("unavailable"))
                     }
                 }
                 ringTriggers[ringEntity] = trig
@@ -819,17 +931,29 @@ object HomeAssistantAuth {
         if (ringTriggers.isEmpty() && existing != null) return
         ringTriggers.values.forEach { triggers.put(it) }
         if (existing != null && config.keys().asSequence().all {
-                it == "id" || config.opt(it).toString() == existing.opt(it).toString()
-            }) return
+                it == "id" || jsonEquals(config.opt(it), existing.opt(it))
+            }
+        ) return
         val request = haRequest(baseUrl, token, path).post(config.toString().toRequestBody(jsonMedia)).build()
         httpClient.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) error("Could not save HA automation (HTTP ${resp.code})")
         }
     }
 
+    private fun jsonEquals(a: Any?, b: Any?): Boolean = when {
+        a === b -> true
+        a is JSONObject && b is JSONObject ->
+            a.length() == b.length() && a.keys().asSequence().all { key -> b.has(key) && jsonEquals(a.opt(key), b.opt(key)) }
+        a is JSONArray && b is JSONArray ->
+            a.length() == b.length() && (0 until a.length()).all { i -> jsonEquals(a.opt(i), b.opt(i)) }
+        else -> a == b
+    }
+
     fun sendTestPushViaHa(context: Context, camera: String? = null) {
-        val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
+        val candidates = endpoints(context)
+        if (candidates.isEmpty()) error("Home Assistant not configured")
         val token = getAccessToken(context) ?: error("Not authenticated")
+        val endpoint = firstReachableEndpoint(candidates, token) ?: error("Could not reach Home Assistant")
         val notifyService = prefs(context).getString("ha_notify_service", null)?.takeIf { it.isNotBlank() }
             ?: setupPushAutomation(context)
         val serviceSlug = notifyService.removePrefix("notify.")
@@ -845,7 +969,7 @@ object HomeAssistantAuth {
                     .put("doorbell_name", name)
                     .put("event_ms", System.currentTimeMillis().toString())
             )
-        val req = haRequest(baseUrl, token, "/api/services/notify/$serviceSlug")
+        val req = haRequest(endpoint, token, "/api/services/notify/$serviceSlug")
             .post(payload.toString().toRequestBody(jsonMedia))
             .build()
         httpClient.newCall(req).execute().use { resp ->
@@ -872,12 +996,18 @@ object HomeAssistantAuth {
         }
     }
 
-    private fun updateRegistration(baseUrl: String, webhookId: String, pushUrl: String, fcmToken: String): Boolean {
+    private fun updateRegistration(
+        context: Context,
+        baseUrl: String,
+        webhookId: String,
+        pushUrl: String,
+        fcmToken: String,
+    ): Boolean {
         val payload = JSONObject().put("type", "update_registration").put(
             "data",
             JSONObject()
-                .put("app_version", "1.0.0")
-                .put("device_name", deviceName())
+                .put("app_version", appVersion(context))
+                .put("device_name", deviceName(context))
                 .put("manufacturer", Build.MANUFACTURER)
                 .put("model", Build.MODEL)
                 .put("os_version", Build.VERSION.RELEASE)
@@ -895,8 +1025,40 @@ object HomeAssistantAuth {
         }
     }
 
+    private fun appVersion(context: Context): String = try {
+        val info = if (Build.VERSION.SDK_INT >= 33) {
+            context.packageManager.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        }
+        info.versionName?.takeIf { it.isNotBlank() } ?: "1.0.0"
+    } catch (_: Exception) {
+        "1.0.0"
+    }
+
+    /**
+     * Preserves legacy Build.MODEL-based registration IDs for existing installs until disconnect,
+     * while giving new installs a unique per-install ID (matching iOS) so identical phone models
+     * in the same household never collide.
+     */
+    private fun deviceIdentity(context: Context): Pair<String, String> {
+        val p = prefs(context)
+        val hasExistingLegacyReg = p.getBoolean("ha_legacy_device", false) ||
+            (!p.getString("ha_webhook_id", null).isNullOrBlank() && p.getString("device_id", null).isNullOrBlank())
+        if (hasExistingLegacyReg) {
+            p.edit().putBoolean("ha_legacy_device", true).apply()
+            return "doorbell_companion_${sanitizeSlug(Build.MODEL)}" to "Doorbell Companion ${Build.MODEL}"
+        }
+        val id = p.getString("device_id", null)?.takeIf { it.isNotBlank() }
+            ?: UUID.randomUUID().toString().replace("-", "").take(12).lowercase().also {
+                p.edit().putString("device_id", it).apply()
+            }
+        return id to "Doorbell Companion Android $id"
+    }
+
     private fun sanitizeSlug(raw: String): String = raw.lowercase().replace(nonAlnum, "_").trim('_')
-    private fun deviceName(): String = "Doorbell Companion ${Build.MODEL}"
-    private fun registrationDeviceId(): String = "doorbell_companion_${sanitizeSlug(Build.MODEL)}"
-    private fun deviceSlug(): String = "mobile_app_${sanitizeSlug(deviceName())}"
+    private fun deviceName(context: Context): String = deviceIdentity(context).second
+    private fun registrationDeviceId(context: Context): String = deviceIdentity(context).first
+    private fun deviceSlug(context: Context): String = "mobile_app_${sanitizeSlug(deviceName(context))}"
 }

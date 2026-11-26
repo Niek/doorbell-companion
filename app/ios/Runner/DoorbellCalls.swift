@@ -13,6 +13,8 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     var answered = false
   }
 
+  private static let ringTimeoutNanoseconds: UInt64 = 30_000_000_000
+
   private let home: HomeAssistant
   private let provider: CXProvider
   private let controller = CXCallController()
@@ -20,7 +22,6 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   private var active: Incoming?
   private var timeout: Task<Void, Never>?
   private var prewarmBackgroundTask: UIBackgroundTaskIdentifier = .invalid
-  private var pendingAnswer: CXAnswerCallAction?
   private weak var cameraView: CameraCallViewController?
   private var audioActive = false
   private(set) var pushToken: String?
@@ -77,6 +78,10 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     let id = (value["call_id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID()
     let name = value["doorbell_name"] as? String ?? "Doorbell"
     let camera = value["camera_entity_id"] as? String
+    let workerTimeMs = (value["received_at"] as? NSNumber)?.int64Value
+      ?? (value["received_at"] as? String).flatMap(Int64.init)
+    let eventTimeMs = (value["event_ms"] as? NSNumber)?.int64Value
+      ?? (value["event_ms"] as? String).flatMap(Int64.init)
     let bell = camera.flatMap { home.selectedDoorbell(camera: $0) }.flatMap { $0.enabled ? $0 : nil }
     let update = CXCallUpdate()
     update.localizedCallerName = bell?.name ?? name
@@ -90,8 +95,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     // Report every VoIP invite immediately, even if the local configuration changed.
     let available = active == nil && bell != nil && home.url != nil
     if available, let bell {
-      let media = makeMedia(bell)
-      media.didNegotiate = { [weak self] in self?.completeAnswer(id) }
+      let media = makeMedia(bell, workerTimeMs: workerTimeMs, eventTimeMs: eventTimeMs)
       media.didFail = { [weak self] _ in self?.failCall(id) }
       active = Incoming(id: id, media: media, usesCallKit: true)
     }
@@ -115,7 +119,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
       }
       active?.media.start()
       timeout = Task { [weak self] in
-        try? await Task.sleep(nanoseconds: 25_000_000_000)
+        try? await Task.sleep(nanoseconds: Self.ringTimeoutNanoseconds)
         guard !Task.isCancelled, let self, self.active?.answered == false else { return }
         self.provider.reportCall(with: id, endedAt: Date(), reason: .unanswered)
         self.finish(id)
@@ -135,13 +139,19 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     } catch {
       NSLog("Doorbell Companion test audio: %@", error.localizedDescription)
     }
+    if bell.talkback, AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+      AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+        Task { @MainActor in self?.active?.media.updateMicrophone() }
+      }
+    }
     media.answer()
     media.start()
     showCameraIfReady()
   }
 
-  private func makeMedia(_ bell: Doorbell) -> CameraCall {
-    CameraCall(bell: bell, home: home, audioReady: { [weak self] in self?.audioActive == true })
+  private func makeMedia(_ bell: Doorbell, workerTimeMs: Int64? = nil, eventTimeMs: Int64? = nil) -> CameraCall {
+    CameraCall(bell: bell, home: home, audioReady: { [weak self] in self?.audioActive == true },
+               workerTimeMs: workerTimeMs, eventTimeMs: eventTimeMs)
   }
 
   func showCameraIfReady() {
@@ -150,7 +160,11 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     var presenter = root
     while let presented = presenter.presentedViewController { presenter = presented }
     guard presenter.viewIfLoaded?.window != nil, !presenter.isBeingDismissed else { return }
-    let call = CameraCallViewController(call: active.media) { [weak self] in self?.endActiveCall() }
+    let call = CameraCallViewController(
+      call: active.media,
+      toggleMute: { [weak self] in self?.toggleActiveMute() },
+      endCall: { [weak self] in self?.endActiveCall() }
+    )
     cameraView = call
     presenter.present(call, animated: true)
   }
@@ -167,13 +181,6 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
     guard active?.id == action.callUUID else { action.fail(); return }
     timeout?.cancel()
-    pendingAnswer = action
-    if active?.media.isNegotiated == true { completeAnswer(action.callUUID) }
-  }
-
-  private func completeAnswer(_ id: UUID) {
-    guard let action = pendingAnswer, action.callUUID == id, active?.id == id else { return }
-    pendingAnswer = nil
     active?.answered = true
     configureAudioSession()
     active?.media.answer()
@@ -182,15 +189,15 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     showCameraIfReady()
   }
 
-  func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-    finish(action.callUUID)
+  func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
+    guard active?.id == action.callUUID else { action.fail(); return }
+    active?.media.setMuted(action.isMuted)
     action.fulfill()
   }
 
-  func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
-    guard let answer = action as? CXAnswerCallAction, pendingAnswer?.callUUID == answer.callUUID else { return }
-    pendingAnswer = nil
-    failCall(answer.callUUID)
+  func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    finish(action.callUUID)
+    action.fulfill()
   }
 
   private func failCall(_ id: UUID) {
@@ -227,6 +234,20 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     self.active?.media.updateMicrophone()
   }
 
+  private func toggleActiveMute() {
+    guard let active else { return }
+    let next = !active.media.muted
+    guard active.usesCallKit else {
+      active.media.setMuted(next)
+      return
+    }
+    let action = CXSetMutedCallAction(call: active.id, muted: next)
+    controller.request(CXTransaction(action: action)) { [weak self] error in
+      guard error != nil else { return }
+      Task { @MainActor in self?.active?.media.setMuted(next) }
+    }
+  }
+
   private func endActiveCall() {
     guard let active else { return }
     guard active.usesCallKit else { finish(active.id); return }
@@ -243,8 +264,6 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     guard let active, active.id == id else { return }
     timeout?.cancel()
     timeout = nil
-    pendingAnswer?.fail()
-    pendingAnswer = nil
     endPrewarmBackgroundTask()
     cameraView?.detach()
     active.media.close()

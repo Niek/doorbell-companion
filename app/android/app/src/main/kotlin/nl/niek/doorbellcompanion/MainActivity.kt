@@ -16,34 +16,38 @@ import com.google.firebase.messaging.FirebaseMessaging
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.InetAddress
-import java.net.ServerSocket
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
-    private data class PendingOAuth(val baseUrl: String, val clientId: String, val state: String, val verifier: String?)
-
     private val main = Handler(Looper.getMainLooper())
     private val syncExecutor = Executors.newSingleThreadExecutor()
     private var channel: MethodChannel? = null
     private var discovery: HomeAssistantDiscovery? = null
     private var passiveLanProbe: HomeAssistantDiscovery? = null
     private val discoveredInternalUrls = mutableMapOf<String, String>()
-    private var loopbackSocket: ServerSocket? = null
-    private var pendingOAuth: PendingOAuth? = null
-    private var oauthAttempt = 0
+    private var pendingCallbackUri: Uri? = null
+    private var pushReady = false
+    private var pushError: String? = null
     private val random = SecureRandom()
     private val base64Url = Base64.getUrlEncoder().withoutPadding()
     private val hostedOAuth by lazy { getSharedPreferences("pending_hosted_oauth", MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        handleOAuthCallback(intent.data)
+        pushReady = HomeAssistantAuth.isPushSynced(this)
+        if (HomeAssistantAuth.isPendingDisconnect(this)) {
+            pushReady = false
+            pushError = "Run Disconnect again to finish signing out of Home Assistant"
+        }
+        val data = intent.data
+        if (channel != null) {
+            handleOAuthCallback(data)
+        } else {
+            pendingCallbackUri = data
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -51,14 +55,29 @@ class MainActivity : FlutterActivity() {
         handleOAuthCallback(intent.data)
     }
 
-    private val syncAutomationRunnable = Runnable {
+    private val syncAutomationRunnable = Runnable { syncPush(refreshTriggers = false) }
+
+    private fun syncPush(refreshTriggers: Boolean) {
         syncExecutor.execute {
+            if (!HomeAssistantAuth.isConfigured(applicationContext)) return@execute
             try {
-                if (HomeAssistantAuth.isConfigured(applicationContext)) {
-                    HomeAssistantAuth.setupPushAutomation(applicationContext)
+                HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = refreshTriggers)
+                main.post {
+                    if (!isDestroyed) {
+                        pushReady = true
+                        pushError = null
+                        pushStatusToFlutter()
+                    }
                 }
             } catch (e: Exception) {
-                Log.w("DoorbellCompanion", "Automation sync error: ${e.message}")
+                Log.w("DoorbellCompanion", "Push sync error: ${e.message}")
+                main.post {
+                    if (!isDestroyed) {
+                        pushReady = false
+                        pushError = e.message ?: "Could not register for doorbell calls"
+                        pushStatusToFlutter()
+                    }
+                }
             }
         }
     }
@@ -67,10 +86,16 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         WebRtcEngine.warmUpAsync(this)
         RingNotification.createChannel(this)
-        FirebaseMessaging.getInstance().token.addOnSuccessListener { saveToken(it) }
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
+        FirebaseMessaging.getInstance().token
+            .addOnSuccessListener { saveToken(it) }
+            .addOnFailureListener { e ->
+                Log.w("DoorbellCompanion", "FCM token fetch failed: ${e.message}")
+                if (HomeAssistantAuth.isConfigured(this) && !pushReady) {
+                    pushError = e.message ?: "Could not get push token"
+                    pushStatusToFlutter()
+                }
+            }
+
         if (HomeAssistantAuth.isConfigured(this)) {
             syncExecutor.execute {
                 try {
@@ -103,7 +128,7 @@ class MainActivity : FlutterActivity() {
                     if (rawUrl.isEmpty()) {
                         result.error("INVALID_URL", "Enter a Home Assistant URL", null)
                     } else {
-                        startBrowserOAuth(HomeAssistantAuth.normalizeBaseUrl(rawUrl), call.argument<Boolean>("local") == true)
+                        startBrowserOAuth(HomeAssistantAuth.normalizeBaseUrl(rawUrl))
                         result.success(null)
                     }
                 }
@@ -121,6 +146,8 @@ class MainActivity : FlutterActivity() {
                             HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
                             main.post {
                                 if (!isDestroyed) {
+                                    pushReady = true
+                                    pushError = null
                                     maybeProbeLanUrl()
                                     result.success(buildStatusMap())
                                 }
@@ -128,6 +155,9 @@ class MainActivity : FlutterActivity() {
                         } catch (e: Exception) {
                             main.post {
                                 if (!isDestroyed) {
+                                    pushReady = false
+                                    pushError = e.message ?: "Could not refresh"
+                                    pushStatusToFlutter()
                                     result.error("REFRESH_FAILED", e.message ?: "Could not refresh", null)
                                 }
                             }
@@ -140,7 +170,7 @@ class MainActivity : FlutterActivity() {
                     val enabled = call.argument<Boolean>("enabled") ?: true
                     if (!entityId.isNullOrBlank()) {
                         HomeAssistantAuth.setDoorbellEnabled(this, entityId, enabled)
-                        // Debounce HA automation update so rapid checkbox toggles feel instant
+                        // Debounce HA subscription update so rapid toggles feel instant.
                         main.removeCallbacks(syncAutomationRunnable)
                         main.postDelayed(syncAutomationRunnable, 400L)
                     }
@@ -152,9 +182,24 @@ class MainActivity : FlutterActivity() {
                     syncExecutor.execute {
                         try {
                             HomeAssistantAuth.disconnect(applicationContext)
-                            main.post { result.success(buildStatusMap()) }
+                            main.post {
+                                if (!isDestroyed) {
+                                    pushReady = false
+                                    pushError = null
+                                    result.success(buildStatusMap())
+                                }
+                            }
                         } catch (e: Exception) {
-                            main.post { result.error("DISCONNECT_FAILED", e.message ?: "Could not disconnect", null) }
+                            main.post {
+                                if (!isDestroyed) {
+                                    if (HomeAssistantAuth.isPendingDisconnect(this)) {
+                                        pushReady = false
+                                        pushError = "Run Disconnect again to finish signing out of Home Assistant"
+                                        pushStatusToFlutter()
+                                    }
+                                    result.error("DISCONNECT_FAILED", e.message ?: "Could not disconnect", null)
+                                }
+                            }
                         }
                     }
                 }
@@ -183,25 +228,28 @@ class MainActivity : FlutterActivity() {
                         Intent(this, CallActivity::class.java)
                             .putExtra("doorbell_name", doorbellName)
                             .putExtra("camera_entity_id", camId)
-                            .putExtra("answer", false)
+                            .putExtra("answer", true)
                     )
                     result.success(null)
                 }
 
                 "testRemotePush" -> {
                     val camera = call.argument<String>("camera")
-                    HomeAssistantAuth.ioExecutor.execute {
-                        try {
-                            Thread.sleep(3_000L)
-                            HomeAssistantAuth.sendTestPushViaHa(applicationContext, camera)
-                            main.post { result.success(null) }
-                        } catch (e: Exception) {
-                            Log.w("DoorbellCompanion", "Remote test push failed: ${e.message}")
-                            main.post {
-                                result.error("TEST_PUSH_FAILED", e.message ?: "Could not send the test call", null)
+                    main.postDelayed({
+                        HomeAssistantAuth.ioExecutor.execute {
+                            try {
+                                HomeAssistantAuth.sendTestPushViaHa(applicationContext, camera)
+                                main.post { if (!isDestroyed) result.success(null) }
+                            } catch (e: Exception) {
+                                Log.w("DoorbellCompanion", "Remote test push failed: ${e.message}")
+                                main.post {
+                                    if (!isDestroyed) {
+                                        result.error("TEST_PUSH_FAILED", e.message ?: "Could not send the test call", null)
+                                    }
+                                }
                             }
                         }
-                    }
+                    }, 3_000L)
                 }
 
                 "requestPermissions" -> {
@@ -213,7 +261,6 @@ class MainActivity : FlutterActivity() {
                             if (canAsk) {
                                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
                             } else {
-                                // Denied twice, or notifications/channel switched off in system settings.
                                 openSettings(
                                     Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
                                         .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
@@ -231,7 +278,7 @@ class MainActivity : FlutterActivity() {
                         }
                         "fullScreen" -> {
                             if (Build.VERSION.SDK_INT >= 34) {
-                                startActivity(
+                                openSettings(
                                     Intent(
                                         Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
                                         Uri.parse("package:$packageName")
@@ -245,6 +292,11 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+
+        pendingCallbackUri?.let { uri ->
+            pendingCallbackUri = null
+            handleOAuthCallback(uri)
         }
     }
 
@@ -291,21 +343,23 @@ class MainActivity : FlutterActivity() {
                 "enabled" to (db.cameraEntityId !in disabled),
             )
         }
-        // Covers the runtime permission and the app-level switch in system settings.
         val notifGranted = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
         val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val fullScreenGranted = if (Build.VERSION.SDK_INT >= 34) {
             getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
         } else true
 
-        return mapOf(
+        val map = mutableMapOf<String, Any?>(
             "haConnected" to haConnected,
             "haUrl" to haUrl,
             "doorbells" to doorbellMaps,
             "notificationsGranted" to notifGranted,
             "microphoneGranted" to micGranted,
             "fullScreenGranted" to fullScreenGranted,
+            "pushReady" to pushReady,
         )
+        pushError?.let { map["pushError"] = it }
+        return map
     }
 
     private fun pushStatusToFlutter() {
@@ -330,14 +384,15 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * If HA's get_config didn't advertise an internal_url, do a short passive mDNS check
-     * and only accept a local LAN URL whose external_url matches our configured ha_url.
+     * If HA's get_config didn't advertise an internal_url (or only advertised a .local hostname),
+     * do a short passive mDNS check and accept a local LAN IP whose external_url matches ours.
      */
     private fun maybeProbeLanUrl() {
         val current = HomeAssistantAuth.getInternalUrl(this)
         val isMdnsHost = current?.contains(".local", ignoreCase = true) == true
         if ((current != null && !isMdnsHost) || passiveLanProbe?.active == true) return
-        val expectedExternal = HomeAssistantAuth.getBaseUrl(this)?.trimEnd('/') ?: return
+        val expectedExternal = (HomeAssistantAuth.getExternalUrl(this) ?: HomeAssistantAuth.getBaseUrl(this))
+            ?.trimEnd('/') ?: return
         val probe = HomeAssistantDiscovery(this) { instances ->
             val match = instances.firstOrNull {
                 it.externalUrl?.equals(expectedExternal, ignoreCase = true) == true &&
@@ -360,55 +415,36 @@ class MainActivity : FlutterActivity() {
         }, 4_000L)
     }
 
-    private fun startBrowserOAuth(baseUrl: String, local: Boolean) {
+    private fun startBrowserOAuth(baseUrl: String) {
         discovery?.stop()
         discovery = null
         cancelPendingOAuth()
-        if (local) {
-            startLoopbackOAuth(baseUrl)
-            return
-        }
-        val attempt = oauthAttempt
-        HomeAssistantAuth.ioExecutor.execute {
-            val supportsPkce = HomeAssistantAuth.supportsPkce(baseUrl)
-            main.post {
-                if (isDestroyed || attempt != oauthAttempt) return@post
-                if (supportsPkce) {
-                    val pending = PendingOAuth(baseUrl, HomeAssistantAuth.ANDROID_CLIENT_ID, oauthNonce(), oauthNonce())
-                    launchOAuth(pending, "doorbell-companion://auth-callback")
-                } else {
-                    startLoopbackOAuth(baseUrl)
-                }
-            }
-        }
-    }
-
-    private fun oauthNonce(): String = base64Url.encodeToString(ByteArray(32).also(random::nextBytes))
-
-    private fun launchOAuth(pending: PendingOAuth, redirectUri: String) {
-        pendingOAuth = pending
-        val url = Uri.parse("${pending.baseUrl}/auth/authorize").buildUpon()
+        val state = oauthNonce()
+        val verifier = oauthNonce()
+        // Persist in SharedPreferences so the callback still completes after process recreation.
+        hostedOAuth.edit()
+            .putString("url", baseUrl)
+            .putString("state", state)
+            .putString("verifier", verifier)
+            .putLong("expires", System.currentTimeMillis() + 10 * 60_000)
+            .apply()
+        val challenge = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
+        val url = Uri.parse("$baseUrl/auth/authorize").buildUpon()
             .appendQueryParameter("response_type", "code")
-            .appendQueryParameter("client_id", pending.clientId)
-            .appendQueryParameter("redirect_uri", redirectUri)
-            .appendQueryParameter("state", pending.state)
-        pending.verifier?.let { verifier ->
-            // The browser can return through a new activity or after process recreation.
-            hostedOAuth.edit()
-                .putString("url", pending.baseUrl)
-                .putString("state", pending.state)
-                .putString("verifier", verifier)
-                .putLong("expires", System.currentTimeMillis() + 10 * 60_000)
-                .apply()
-            val challenge = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
-            url.appendQueryParameter("code_challenge", base64Url.encodeToString(challenge))
-                .appendQueryParameter("code_challenge_method", "S256")
-        }
-        if (!openCustomTab(url.build().toString())) {
+            .appendQueryParameter("client_id", HomeAssistantAuth.ANDROID_CLIENT_ID)
+            .appendQueryParameter("redirect_uri", "doorbell-companion://auth-callback")
+            .appendQueryParameter("state", state)
+            .appendQueryParameter("code_challenge", base64Url.encodeToString(challenge))
+            .appendQueryParameter("code_challenge_method", "S256")
+            .build()
+            .toString()
+        if (!openCustomTab(url)) {
             cancelPendingOAuth()
             channel?.invokeMethod("onOAuthError", "No browser app found to sign in")
         }
     }
+
+    private fun oauthNonce(): String = base64Url.encodeToString(ByteArray(32).also(random::nextBytes))
 
     private fun handleOAuthCallback(uri: Uri?) {
         if (uri == null || uri.scheme != "doorbell-companion" ||
@@ -419,87 +455,40 @@ class MainActivity : FlutterActivity() {
         if (uri.getQueryParameter("state") != state) return
         val url = hostedOAuth.getString("url", null) ?: return
         val verifier = hostedOAuth.getString("verifier", null) ?: return
-        completeOAuthCode(uri.getQueryParameter("code"), PendingOAuth(url, HomeAssistantAuth.ANDROID_CLIENT_ID, state, verifier))
+        completeOAuthCode(uri.getQueryParameter("code"), url, verifier)
     }
 
-    private fun startLoopbackOAuth(baseUrl: String) {
-        try {
-            val server = ServerSocket(0, 5, InetAddress.getByName("127.0.0.1"))
-            loopbackSocket = server
-            val clientId = "http://127.0.0.1:${server.localPort}"
-            val pending = PendingOAuth(baseUrl, clientId, oauthNonce(), null)
-
-            HomeAssistantAuth.ioExecutor.execute {
-                try {
-                    while (!server.isClosed) {
-                        server.accept().use { client ->
-                            client.soTimeout = 5_000
-                            val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.UTF_8))
-                            val reqLine = reader.readLine() ?: return@use
-                            val path = reqLine.split(' ').getOrNull(1) ?: return@use
-                            val callback = Uri.parse("$clientId$path")
-                            if (callback.path != "/callback" || callback.getQueryParameter("state") != pending.state) {
-                                client.getOutputStream().write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".toByteArray())
-                                return@use
-                            }
-                            val code = callback.getQueryParameter("code")
-                            val html = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
-                                "<meta http-equiv=\"refresh\" content=\"0;url=doorbell-companion://auth-done\"></head>" +
-                                "<body style=\"font-family:sans-serif;padding:32px;text-align:center\">" +
-                                "<h2>Connected to Doorbell Companion</h2><p>Returning to the app…</p></body></html>"
-                            val resp = "HTTP/1.1 302 Found\r\n" +
-                                "Location: doorbell-companion://auth-done\r\n" +
-                                "Content-Type: text/html; charset=utf-8\r\n" +
-                                "Content-Length: ${html.toByteArray().size}\r\n" +
-                                "Connection: close\r\n\r\n$html"
-                            client.getOutputStream().apply {
-                                write(resp.toByteArray())
-                                flush()
-                            }
-                            server.close()
-                            main.post {
-                                if (!isDestroyed && pendingOAuth === pending) {
-                                    startActivity(
-                                        Intent(this@MainActivity, MainActivity::class.java)
-                                            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                                    )
-                                    completeOAuthCode(code, pending)
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-
-            launchOAuth(pending, "$clientId/callback")
-        } catch (e: Exception) {
-            cancelPendingOAuth()
-            channel?.invokeMethod("onOAuthError", e.message ?: "Could not open browser")
-        }
-    }
-
-    private fun completeOAuthCode(code: String?, pending: PendingOAuth) {
+    private fun completeOAuthCode(code: String?, baseUrl: String, verifier: String) {
         cancelPendingOAuth()
         if (code.isNullOrBlank()) {
             channel?.invokeMethod("onOAuthError", "Sign-in was cancelled")
             return
         }
         channel?.invokeMethod("onOAuthProgress", "Discovering doorbells & setting up notifications…")
-        val knownInternalUrl = discoveredInternalUrls[pending.baseUrl]
+        val knownInternalUrl = discoveredInternalUrls[baseUrl]
         syncExecutor.execute {
             try {
-                val ok = HomeAssistantAuth.exchangeCode(applicationContext, pending.baseUrl, code, pending.clientId, pending.verifier)
+                val ok = HomeAssistantAuth.exchangeCode(
+                    applicationContext, baseUrl, code, HomeAssistantAuth.ANDROID_CLIENT_ID, verifier,
+                )
                 if (!ok) error("Token exchange failed")
                 HomeAssistantAuth.saveInternalUrl(applicationContext, knownInternalUrl)
                 HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
+                var setupErr: String? = null
+                var ready = false
                 try {
                     HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
+                    ready = true
                 } catch (e: Exception) {
                     Log.w("DoorbellCompanion", "Initial push setup note: ${e.message}")
+                    setupErr = e.message
                 }
                 main.post {
                     if (!isDestroyed) {
+                        pushReady = ready
+                        pushError = setupErr
                         channel?.invokeMethod("onOAuthComplete", buildStatusMap())
+                        requestPostOnboardingPermissions()
                         maybeProbeLanUrl()
                     }
                 }
@@ -510,6 +499,25 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun requestPostOnboardingPermissions() {
+        val toRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            canShowPermissionDialog(Manifest.permission.POST_NOTIFICATIONS)
+        ) {
+            toRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (HomeAssistantAuth.hasAnyTwoWayAudio(this) &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED &&
+            canShowPermissionDialog(Manifest.permission.RECORD_AUDIO)
+        ) {
+            toRequest.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (toRequest.isNotEmpty()) {
+            requestPermissions(toRequest.toTypedArray(), 1)
         }
     }
 
@@ -529,40 +537,23 @@ class MainActivity : FlutterActivity() {
     private fun saveToken(token: String) {
         val prefs = HomeAssistantAuth.prefs(this)
         prefs.edit().putString("fcm_token", token).apply()
-        if (HomeAssistantAuth.isConfigured(this)) {
-            if (prefs.getString("ha_notify_service", null).isNullOrBlank() ||
-                prefs.getString("ha_push_url", null) != HomeAssistantAuth.PUSH_RELAY_URL
+        if (HomeAssistantAuth.isConfigured(this) && !HomeAssistantAuth.isPendingDisconnect(this)) {
+            if (!HomeAssistantAuth.isPushSynced(this) ||
+                prefs.getString("ha_registered_push_token", null) != token
             ) {
-                syncExecutor.execute {
-                    try {
-                        HomeAssistantAuth.setupPushAutomation(applicationContext)
-                    } catch (e: Exception) {
-                        Log.w("DoorbellCompanion", "Auto push setup failed: ${e.message}")
-                    }
-                }
-            } else {
-                HomeAssistantAuth.syncPushTokenIfRegistered(this, token)
+                syncPush(refreshTriggers = false)
             }
         }
     }
 
     private fun cancelPendingOAuth() {
-        oauthAttempt++
-        pendingOAuth = null
         hostedOAuth.edit().clear().apply()
-        closeLoopback()
-    }
-
-    private fun closeLoopback() {
-        try { loopbackSocket?.close() } catch (_: Exception) {}
-        loopbackSocket = null
     }
 
     override fun onDestroy() {
         main.removeCallbacks(syncAutomationRunnable)
         discovery?.stop()
         passiveLanProbe?.stop()
-        closeLoopback()
         syncExecutor.shutdownNow()
         super.onDestroy()
     }

@@ -126,7 +126,7 @@ object HomeAssistantPrewarm {
         val remote = HomeAssistantRemote(context.applicationContext, cameraEntityId)
         pending = remote
         main.removeCallbacks(timeoutRunnable)
-        main.postDelayed(timeoutRunnable, 35_000L)
+        main.postDelayed(timeoutRunnable, RingNotification.RING_TIMEOUT_MS)
         remote.connect()
     }
 
@@ -174,6 +174,7 @@ class HomeAssistantRemote(
     private var candidateEndpoints: List<Pair<String, String>> = emptyList()
     private var currentToken: String? = null
     private var needInitialIceConfig = false
+    private val peerSetupStarted = AtomicBoolean(false)
 
     private var peer: PeerConnection? = null
     private var audioTransceiver: RtpTransceiver? = null
@@ -238,16 +239,15 @@ class HomeAssistantRemote(
     fun connect() {
         timing?.mark("ha_remote_start", "entity=$cameraEntityId")
         val prefs = HomeAssistantAuth.prefs(context)
-        val baseUrl = prefs.getString("ha_url", null)
-        if (baseUrl.isNullOrBlank()) {
+        val urls = HomeAssistantAuth.endpoints(context)
+        if (urls.isEmpty()) {
             reportStatus("Connect Home Assistant first")
             return
         }
-
         val internalUrl = HomeAssistantAuth.getInternalUrl(context)
-        val endpoints = buildList {
-            if (internalUrl != null) add("lan" to internalUrl)
-            add("ext" to baseUrl)
+        val endpoints = urls.mapIndexed { idx, url ->
+            val label = if (url == internalUrl) "lan" else if (idx == 0) "primary" else "ext"
+            label to url
         }
 
         val cachedIceJson = prefs.getString("ha_ice_servers", null)
@@ -291,7 +291,7 @@ class HomeAssistantRemote(
 
     /** Keeps cold WebRtcEngine initialization off `executor` so WebSocket auth is never blocked. */
     private fun startPeerSetup(iceServers: List<PeerConnection.IceServer>) {
-        if (closed) return
+        if (closed || !peerSetupStarted.compareAndSet(false, true)) return
         if (WebRtcEngine.isReady()) {
             schedule { createPeerAndOffer(iceServers) }
         } else {
@@ -467,7 +467,7 @@ class HomeAssistantRemote(
                                 .putLong("ha_ice_servers_time", System.currentTimeMillis())
                                 .apply()
                         }
-                        if (peer == null) {
+                        if (!peerSetupStarted.get()) {
                             startPeerSetup(parseIceServers(iceArr?.toString()))
                         }
                     } else if (id == offerMsgId && !msg.optBoolean("success", true)) {
@@ -586,7 +586,7 @@ class HomeAssistantRemote(
                                             latestSnapshot = null
                                             cancelSnapshotCalls()
                                             timing?.mark("first_frame_decoded")
-                                            main.post {
+                                            schedule {
                                                 try { track.removeSink(this) } catch (_: Exception) {}
                                             }
                                         }
@@ -768,7 +768,7 @@ class HomeAssistantRemote(
         for (rawLine in sdp.lineSequence()) {
             val line = rawLine.trim()
             if (line.startsWith("m=")) {
-                inAudio = line.startsWith("m=audio ")
+                inAudio = line.startsWith("m=audio ") && !line.startsWith("m=audio 0 ")
             } else if (inAudio) {
                 if (line == "a=sendrecv" || line == "a=recvonly") return true
                 if (line == "a=sendonly" || line == "a=inactive") return false
