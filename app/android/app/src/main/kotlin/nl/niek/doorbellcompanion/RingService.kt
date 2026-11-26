@@ -1,6 +1,7 @@
 package nl.niek.doorbellcompanion
 
 import android.app.ActivityOptions
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,10 +11,13 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
+import android.media.ThumbnailUtils
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -47,8 +51,6 @@ class RingService : FirebaseMessagingService() {
                 .putString("last_doorbell_name", doorbellName)
             if (camId != null) {
                 editor.putString("last_ha_camera", camId)
-                // Start WebRTC negotiation immediately at t=0ms before CallActivity opens
-                HomeAssistantPrewarm.start(this, camId)
             }
             editor.apply()
         }
@@ -98,6 +100,7 @@ object RingNotification {
             )
         } catch (e: RuntimeException) {
             Log.w("DoorbellCompanion", "Unable to start ringtone service", e)
+            cameraEntityId?.let { HomeAssistantPrewarm.start(context, it) }
             context.getSystemService(NotificationManager::class.java)
                 .notify(ID, build(context, false, doorbellName, cameraEntityId))
         }
@@ -113,6 +116,8 @@ object RingNotification {
         looping: Boolean,
         doorbellName: String = "Doorbell",
         cameraEntityId: String? = null,
+        thumbnail: Bitmap? = null,
+        publicVersion: Notification? = null,
     ): Notification {
         createChannel(context)
         val intent = Intent(context, CallActivity::class.java)
@@ -137,10 +142,17 @@ object RingNotification {
             .setContentIntent(pending)
             .setFullScreenIntent(pending, true)
             .setOngoing(true)
+        if (thumbnail != null) {
+            builder.setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(publicVersion)
+                .setOnlyAlertOnce(true)
+        }
         if (Build.VERSION.SDK_INT >= 31) {
-            val caller = Person.Builder().setName(doorbellName).setImportant(true).build()
-            builder.setStyle(Notification.CallStyle.forIncomingCall(caller, decline, answer))
+            val caller = Person.Builder().setName(doorbellName).setImportant(true)
+            thumbnail?.let { caller.setIcon(Icon.createWithBitmap(it)) }
+            builder.setStyle(Notification.CallStyle.forIncomingCall(caller.build(), decline, answer))
         } else {
+            thumbnail?.let { builder.setLargeIcon(it) }
             builder.addAction(R.drawable.ic_call_end, "Decline", decline)
             builder.addAction(R.drawable.ic_call, "Answer", answer)
         }
@@ -149,10 +161,16 @@ object RingNotification {
 }
 
 class RingtoneService : Service() {
+    private companion object {
+        const val THUMBNAIL_SIZE_PX = 160
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private var player: MediaPlayer? = null
     private var vibrating = false
+    private var ringingStartId: Int? = null
     private val autoStopRunnable = Runnable {
+        ringingStartId = null
         HomeAssistantPrewarm.cancel()
         stopSelf()
     }
@@ -170,7 +188,25 @@ class RingtoneService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val doorbellName = intent?.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() } ?: "Doorbell"
         val cameraEntityId = intent?.getStringExtra("camera_entity_id")?.takeIf { it.isNotBlank() }
-        startForeground(RingNotification.ID, RingNotification.build(this, true, doorbellName, cameraEntityId))
+        val notification = RingNotification.build(this, true, doorbellName, cameraEntityId)
+        ringingStartId = startId
+        if (cameraEntityId != null) {
+            HomeAssistantPrewarm.start(this, cameraEntityId) { snapshot ->
+                val thumbnail = ThumbnailUtils.extractThumbnail(snapshot, THUMBNAIL_SIZE_PX, THUMBNAIL_SIZE_PX)
+                main.post {
+                    if (ringingStartId != startId || getSystemService(KeyguardManager::class.java).isKeyguardLocked) {
+                        return@post
+                    }
+                    val manager = getSystemService(NotificationManager::class.java)
+                    if (manager.activeNotifications.none { it.id == RingNotification.ID }) return@post
+                    val updated = RingNotification.build(
+                        this, true, doorbellName, cameraEntityId, thumbnail, publicVersion = notification,
+                    )
+                    manager.notify(RingNotification.ID, updated)
+                }
+            }
+        }
+        startForeground(RingNotification.ID, notification)
 
         // Auto-stop unanswered rings so sound/vibration never loop indefinitely.
         main.removeCallbacks(autoStopRunnable)
@@ -215,6 +251,7 @@ class RingtoneService : Service() {
     }
 
     override fun onDestroy() {
+        ringingStartId = null
         main.removeCallbacks(autoStopRunnable)
         player?.release()
         player = null

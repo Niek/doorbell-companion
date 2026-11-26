@@ -121,9 +121,11 @@ object HomeAssistantPrewarm {
     private val timeoutRunnable = Runnable { cancel() }
 
     @Synchronized
-    fun start(context: Context, cameraEntityId: String) {
+    fun start(context: Context, cameraEntityId: String, ringSnapshotListener: ((Bitmap) -> Unit)? = null) {
         pending?.close()
-        val remote = HomeAssistantRemote(context.applicationContext, cameraEntityId)
+        val remote = HomeAssistantRemote(
+            context.applicationContext, cameraEntityId, ringSnapshotListener = ringSnapshotListener,
+        )
         pending = remote
         main.removeCallbacks(timeoutRunnable)
         main.postDelayed(timeoutRunnable, RingNotification.RING_TIMEOUT_MS)
@@ -159,6 +161,7 @@ class HomeAssistantRemote(
     @Volatile private var status: (String) -> Unit = {},
     @Volatile private var onMicState: (Boolean) -> Unit = {},
     @Volatile private var onSnapshot: (Bitmap) -> Unit = {},
+    @Volatile private var ringSnapshotListener: ((Bitmap) -> Unit)? = null,
 ) {
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -228,6 +231,7 @@ class HomeAssistantRemote(
         status = statusListener
         onMicState = micStateListener
         onSnapshot = snapshotListener
+        ringSnapshotListener = null
         statusListener(latestStatus)
         if (!firstFrameDecoded) {
             latestSnapshot?.let(snapshotListener)
@@ -308,8 +312,10 @@ class HomeAssistantRemote(
         }
     }
 
+    private fun needsSnapshot() = !firstFrameDecoded || ringSnapshotListener != null
+
     private fun fetchSnapshotAsync(endpoints: List<Pair<String, String>>, token: String) {
-        if (closed || firstFrameDecoded || !snapshotStarted.compareAndSet(false, true)) return
+        if (closed || !needsSnapshot() || !snapshotStarted.compareAndSet(false, true)) return
         for ((label, url) in endpoints) {
             val req = Request.Builder()
                 .url("$url/api/camera_proxy/$cameraEntityId")
@@ -326,15 +332,20 @@ class HomeAssistantRemote(
                 override fun onResponse(call: Call, response: Response) {
                     snapshotCalls.remove(call)
                     response.use { resp ->
-                        if (!resp.isSuccessful || closed || firstFrameDecoded || snapshotDelivered.get()) return
+                        if (!resp.isSuccessful || closed || !needsSnapshot() || snapshotDelivered.get()) return
                         val bytes = try { resp.body?.bytes() } catch (_: Exception) { null } ?: return
-                        if (bytes.isEmpty() || closed || firstFrameDecoded) return
+                        if (bytes.isEmpty() || closed || !needsSnapshot()) return
                         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
-                        if (!closed && !firstFrameDecoded && snapshotDelivered.compareAndSet(false, true)) {
+                        if (!closed && needsSnapshot() && snapshotDelivered.compareAndSet(false, true)) {
                             timing?.mark("snapshot_loaded", "endpoint=$label bytes=${bytes.size} size=${bmp.width}x${bmp.height}")
                             cancelSnapshotCalls()
-                            latestSnapshot = bmp
-                            onSnapshot(bmp)
+                            if (!firstFrameDecoded) {
+                                latestSnapshot = bmp
+                                onSnapshot(bmp)
+                            }
+                            val listener = ringSnapshotListener
+                            ringSnapshotListener = null
+                            listener?.invoke(bmp)
                         }
                     }
                 }
@@ -584,7 +595,7 @@ class HomeAssistantRemote(
                                         if (first.compareAndSet(false, true)) {
                                             firstFrameDecoded = true
                                             latestSnapshot = null
-                                            cancelSnapshotCalls()
+                                            if (!needsSnapshot()) cancelSnapshotCalls()
                                             timing?.mark("first_frame_decoded")
                                             schedule {
                                                 try { track.removeSink(this) } catch (_: Exception) {}
@@ -845,6 +856,7 @@ class HomeAssistantRemote(
         if (closed) return
         closed = true
         latestSnapshot = null
+        ringSnapshotListener = null
         cancelSnapshotCalls()
         releaseWifiLock()
         try {
