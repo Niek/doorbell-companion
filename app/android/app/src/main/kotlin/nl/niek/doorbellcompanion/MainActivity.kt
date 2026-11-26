@@ -73,7 +73,16 @@ class MainActivity : FlutterActivity() {
         }
         if (HomeAssistantAuth.isConfigured(this)) {
             syncExecutor.execute {
-                try { HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext) } catch (_: Exception) {}
+                try {
+                    HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
+                    if (HomeAssistantAuth.needsDoorbellSubscriptionSync(applicationContext) &&
+                        !HomeAssistantAuth.prefs(this).getString("fcm_token", null).isNullOrBlank()
+                    ) {
+                        HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
+                    }
+                } catch (e: Exception) {
+                    Log.w("DoorbellCompanion", "Doorbell setup on launch failed: ${e.message}")
+                }
                 main.post {
                     if (!isDestroyed) {
                         pushStatusToFlutter()
@@ -114,7 +123,7 @@ class MainActivity : FlutterActivity() {
                     syncExecutor.execute {
                         try {
                             HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
-                            HomeAssistantAuth.setupPushAutomation(applicationContext)
+                            HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
                             main.post {
                                 if (!isDestroyed) {
                                     maybeProbeLanUrl()
@@ -489,7 +498,7 @@ class MainActivity : FlutterActivity() {
                 HomeAssistantAuth.saveInternalUrl(applicationContext, knownInternalUrl)
                 HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
                 try {
-                    HomeAssistantAuth.setupPushAutomation(applicationContext)
+                    HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
                 } catch (e: Exception) {
                     Log.w("DoorbellCompanion", "Initial push setup note: ${e.message}")
                 }

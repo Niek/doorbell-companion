@@ -50,13 +50,13 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ## Setup
 
 1. Open the app on your home Wi-Fi and pick your Home Assistant, or enter its URL.
-2. Sign in. The app finds your doorbells and creates the automation.
+2. Sign in. The app finds your doorbells and sets up one shared Home Assistant automation. Each phone can choose which doorbells call it.
 3. Allow notifications, and on Android full-screen calls. Allow the microphone for talkback.
 4. Under a doorbell, tap **View** to check the camera, then **Test ring** and lock your phone within 3 seconds.
 
 Moving from a build with an older app ID? Disconnect that one first to avoid double rings.
 
-Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the ring automation and Mobile App registration and revokes this phone’s Home Assistant session. Uninstalling alone leaves the Home Assistant setup in place.
+Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the phone’s doorbell subscriptions and Mobile App registration and revokes its Home Assistant session. The shared automation serves the remaining phones.
 
 ## Self-hosting the relay
 
@@ -64,7 +64,7 @@ The app uses a hosted relay by default. To run your own, follow the [Worker setu
 
 ## Tips
 
-- **UniFi Protect:** enable the medium-resolution camera entity in Home Assistant and tap refresh in Settings. The app prefers it, which starts video faster on cellular.
+- **UniFi Protect:** enable the medium-resolution camera entity for faster video startup on cellular. Tap refresh in the app’s Settings to rescan doorbells and update the shared automation.
 - **Timings:** run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I` on Android, or filter the Xcode console for `Doorbell Companion` on iOS.
 
 ## License

@@ -18,10 +18,26 @@ struct Doorbell: Codable {
   let camera: String
   let name: String
   let triggers: [String]
+  var nativeRingEvents: [String]?
   var talkback = false
   var enabled = true
 
   var flutterValue: JSON { ["cameraEntityId": camera, "name": name, "enabled": enabled] }
+
+  func automationTrigger(for entity: String, id: String) -> JSON {
+    if nativeRingEvents?.contains(entity) == true {
+      return ["trigger": "event.received", "id": id,
+              "target": ["entity_id": entity], "options": ["event_type": ["ring"]]]
+    }
+    var trigger: JSON = ["trigger": "state", "entity_id": entity, "id": id]
+    if entity.hasPrefix("binary_sensor.") {
+      trigger["to"] = "on"
+    } else {
+      trigger["not_from"] = ["unknown", "unavailable"]
+      trigger["not_to"] = ["unknown", "unavailable"]
+    }
+    return trigger
+  }
 }
 
 struct HACredentials: Codable {
@@ -206,7 +222,8 @@ final class HomeAssistant {
         let states = try await socket.command("get_states") as? [JSON] ?? []
         let config = try await socket.command("get_config") as? JSON ?? [:]
         let disabled = Set(doorbells.filter { !$0.enabled }.map(\.camera))
-        var discovered = Self.discoverDoorbells(devices: devices, entities: entities, states: states)
+        var discovered = Self.discoverDoorbells(devices: devices, entities: entities, states: states,
+                                                version: config["version"] as? String)
         for index in discovered.indices {
           let result = try? await socket.command("camera/capabilities", fields: [
             "entity_id": discovered[index].camera,
@@ -229,17 +246,27 @@ final class HomeAssistant {
     throw lastError
   }
 
-  static func discoverDoorbells(devices: [JSON], entities: [JSON], states: [JSON]) -> [Doorbell] {
+  static func discoverDoorbells(devices: [JSON], entities: [JSON], states: [JSON],
+                                version: String? = nil) -> [Doorbell] {
     var names: [String: String] = [:]
     for device in devices {
       guard let id = device["id"] as? String else { continue }
       names[id] = device["name_by_user"] as? String ?? device["name"] as? String
     }
     var friendlyNames: [String: String] = [:]
+    var ringEvents = Set<String>()
     for state in states {
       guard let id = state["entity_id"] as? String else { continue }
-      friendlyNames[id] = (state["attributes"] as? JSON)?["friendly_name"] as? String
+      let attributes = state["attributes"] as? JSON
+      friendlyNames[id] = attributes?["friendly_name"] as? String
+      if (attributes?["event_types"] as? [String])?.contains("ring") == true {
+        ringEvents.insert(id)
+      }
     }
+    // The event.received trigger became available without opting in to Labs in 2026.7.
+    let versionParts = version?.split(separator: ".") ?? []
+    let supportsEventTrigger = versionParts.count >= 2 &&
+      (Int(versionParts[0]) ?? 0, Int(versionParts[1]) ?? 0) >= (2026, 7)
     var cameras: [String: [JSON]] = [:]
     var standalone: [JSON] = []
     var rings: [String: [String]] = [:]
@@ -255,6 +282,9 @@ final class HomeAssistant {
         if classes.contains(where: { entity[$0] as? String == "doorbell" })
             || id.hasSuffix("_doorbell") {
           rings[device, default: []].append(id)
+          if id.hasPrefix("event."), entity["platform"] as? String == "unifiprotect" {
+            ringEvents.insert(id)
+          }
         }
       }
     }
@@ -262,9 +292,11 @@ final class HomeAssistant {
     for (device, triggers) in rings {
       guard let best = cameras[device]?.min(by: { cameraRank($0) < cameraRank($1) }),
             let camera = best["entity_id"] as? String else { continue }
-      let binary = triggers.filter { $0.hasPrefix("binary_sensor.") }
+      let events = triggers.filter { $0.hasPrefix("event.") }
+      let selected = events.isEmpty ? triggers : events
+      let native = supportsEventTrigger ? events.filter { ringEvents.contains($0) } : []
       result.append(Doorbell(camera: camera, name: names[device] ?? friendlyNames[camera] ?? camera,
-                             triggers: binary.isEmpty ? triggers : binary))
+                             triggers: selected, nativeRingEvents: native.isEmpty ? nil : native))
     }
     if result.isEmpty {
       result = (cameras.values.flatMap { $0 } + standalone).compactMap { entity in
@@ -298,12 +330,17 @@ final class HomeAssistant {
 
   func setupPush(token pushToken: String, force: Bool = false) async throws {
     guard url != nil else { return }
+    let syncKey = "synced_doorbell_subscription"
+    let migrating = defaults.data(forKey: "synced_automation") != nil && defaults.data(forKey: syncKey) == nil
+    if migrating, !force {
+      try await refreshDoorbells()
+    }
     let enabled = doorbells.filter { $0.enabled && !$0.triggers.isEmpty }
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
     let automationState = try encoder.encode(enabled)
     if !force, deviceRegistration != nil, registeredPushToken == pushToken,
-       defaults.data(forKey: "synced_automation") == automationState {
+       defaults.data(forKey: syncKey) == automationState {
       return
     }
     let token = try await accessToken()
@@ -343,37 +380,62 @@ final class HomeAssistant {
     registeredPushToken = pushToken
     defaults.set(pushToken, forKey: "registered_push_token")
 
-    let path = "api/config/automation/config/\(automationID)"
-    if enabled.isEmpty {
-      _ = try await request(at: endpoint, path: path, token: token, method: "DELETE", allowMissing: true)
-      defaults.set(automationState, forKey: "synced_automation")
-      return
-    }
-
-    var triggers: [JSON] = []
-    var branches: [JSON] = []
-    for (index, bell) in enabled.enumerated() {
-      let triggerID = "doorbell_\(index)"
+    try await syncSharedAutomation(at: endpoint, token: token, refreshTriggers: force || migrating)
+    guard let registration = deviceRegistration else { throw DoorbellCompanionError("Missing phone registration") }
+    var routes: [String: [String: String]] = [:]
+    for bell in enabled {
       for entity in bell.triggers {
-        var trigger: JSON = ["trigger": "state", "entity_id": entity, "id": triggerID]
-        if entity.hasPrefix("binary_sensor.") {
-          trigger["to"] = "on"
-        } else {
-          trigger["not_from"] = ["unknown", "unavailable"]
-          trigger["not_to"] = ["unknown", "unavailable"]
-        }
-        triggers.append(trigger)
+        routes[entity] = ["camera_entity_id": bell.camera, "doorbell_name": bell.name]
       }
-      branches.append([
-        "conditions": [["condition": "trigger", "id": triggerID]],
-        "sequence": [["action": "notify.\(notifyService)", "data": pushPayload(for: bell)]],
-      ])
     }
-    _ = try await request(at: endpoint, path: path, token: token, json: [
-      "id": automationID, "alias": "Doorbell Companion: Doorbell Call (iOS \(deviceID))",
-      "mode": "parallel", "triggers": triggers, "conditions": [], "actions": [["choose": branches]],
+    let subscription: JSON = ["service": "notify.\(notifyService)", "doorbells": routes]
+    let result = try await request(at: endpoint, path: "api/webhook/\(registration)", json: [
+      "type": "register_sensor", "data": [
+        "type": "sensor", "unique_id": "doorbell_companion_subscription", "name": "Doorbell subscription",
+        "entity_category": "diagnostic", "state": routes.count,
+        "attributes": ["doorbell_companion_subscription": subscription],
+      ],
     ])
-    defaults.set(automationState, forKey: "synced_automation")
+    guard (try JSONSerialization.jsonObject(with: result) as? JSON)?["success"] as? Bool == true else {
+      throw DoorbellCompanionError("Home Assistant could not save this phone's doorbell subscriptions")
+    }
+    _ = try await request(at: endpoint, path: "api/config/automation/config/\(automationID)",
+                          token: token, method: "DELETE", allowMissing: true)
+    defaults.set(automationState, forKey: syncKey)
+    defaults.removeObject(forKey: "synced_automation")
+  }
+
+  static func sharedAutomationTemplate() throws -> JSON {
+    guard let assetURL = Bundle.main.privateFrameworksURL?
+      .appendingPathComponent("App.framework/flutter_assets/assets/doorbell_automation.json"),
+          let config = try JSONSerialization.jsonObject(with: Data(contentsOf: assetURL)) as? JSON else {
+      throw DoorbellCompanionError("Doorbell automation template is missing")
+    }
+    return config
+  }
+
+  private func syncSharedAutomation(at endpoint: URL, token: String, refreshTriggers: Bool) async throws {
+    var config = try Self.sharedAutomationTemplate()
+    guard let id = config["id"] as? String, let dispatchTriggers = config["triggers"] as? [JSON] else {
+      throw DoorbellCompanionError("Invalid doorbell automation template")
+    }
+    let path = "api/config/automation/config/\(id)"
+    let data = try await request(at: endpoint, path: path, token: token, allowMissing: true)
+    let existing = (try? JSONSerialization.jsonObject(with: data)) as? JSON ?? [:]
+    if !refreshTriggers, existing["triggers"] != nil { return }
+    var ringTriggers: [String: JSON] = [:]
+    for bell in doorbells {
+      for entity in bell.triggers {
+        ringTriggers[entity] = bell.automationTrigger(for: entity, id: entity)
+      }
+    }
+    if ringTriggers.isEmpty, existing["triggers"] != nil { return }
+    config["triggers"] = dispatchTriggers + ringTriggers.keys.sorted().compactMap { ringTriggers[$0] }
+    let current = existing as NSDictionary
+    if config.allSatisfy({ key, value in
+      key == "id" || (value as? NSObject)?.isEqual(current[key]) == true
+    }) { return }
+    _ = try await request(at: endpoint, path: path, token: token, json: config)
   }
 
   func testPush(bell: Doorbell) async throws {
@@ -430,7 +492,7 @@ final class HomeAssistant {
     deviceRegistration = nil
     registeredPushToken = nil
     registrationServer = nil
-    for key in ["doorbells", "local_url", "external_url", "synced_automation", "registration",
+    for key in ["doorbells", "local_url", "external_url", "synced_automation", "synced_doorbell_subscription", "registration",
                 "registered_push_token", "registration_server"] {
       defaults.removeObject(forKey: key)
     }

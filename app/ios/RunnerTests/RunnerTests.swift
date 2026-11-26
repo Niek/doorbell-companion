@@ -3,20 +3,42 @@ import XCTest
 
 final class RunnerTests: XCTestCase {
   @MainActor
-  func testDoorbellDiscoveryPrefersEnabledMediumCameraAndBinaryTrigger() {
+  func testSharedDoorbellAutomationIsBundled() throws {
+    let automation = try HomeAssistant.sharedAutomationTemplate()
+    XCTAssertEqual(automation["id"] as? String, "doorbell_companion_doorbell_call")
+    XCTAssertEqual(automation["mode"] as? String, "parallel")
+  }
+
+  @MainActor
+  func testDoorbellDiscoveryPrefersEnabledMediumCameraAndEventTrigger() {
     let devices: [JSON] = [["id": "door", "name_by_user": "Front Door"]]
     let entities: [JSON] = [
       ["device_id": "door", "entity_id": "camera.high", "unique_id": "front_0"],
       ["device_id": "door", "entity_id": "camera.medium", "unique_id": "front_1"],
       ["device_id": "door", "entity_id": "camera.medium_disabled", "disabled_by": "user"],
       ["device_id": "door", "entity_id": "binary_sensor.nvr_doorbell"],
-      ["device_id": "door", "entity_id": "event.front_doorbell", "original_device_class": "doorbell"],
+      ["device_id": "door", "entity_id": "event.front_doorbell", "original_device_class": "doorbell",
+       "platform": "unifiprotect"],
     ]
-    let bells = HomeAssistant.discoverDoorbells(devices: devices, entities: entities, states: [])
+    let bells = HomeAssistant.discoverDoorbells(devices: devices, entities: entities, states: [], version: "2026.11.0")
     XCTAssertEqual(bells.count, 1)
     XCTAssertEqual(bells.first?.camera, "camera.medium")
     XCTAssertEqual(bells.first?.name, "Front Door")
-    XCTAssertEqual(bells.first?.triggers, ["binary_sensor.nvr_doorbell"])
+    XCTAssertEqual(bells.first?.triggers, ["event.front_doorbell"])
+    let trigger = bells.first?.automationTrigger(for: "event.front_doorbell", id: "front")
+    XCTAssertEqual(trigger?["trigger"] as? String, "event.received")
+    XCTAssertEqual(trigger?["id"] as? String, "front")
+    XCTAssertEqual(trigger?["target"] as? [String: String], ["entity_id": "event.front_doorbell"])
+    XCTAssertEqual(trigger?["options"] as? [String: [String]], ["event_type": ["ring"]])
+
+    let older = HomeAssistant.discoverDoorbells(devices: devices, entities: entities, states: [], version: "2026.6.3")
+    XCTAssertEqual(older.first?.triggers, ["event.front_doorbell"])
+    XCTAssertEqual(older.first?.automationTrigger(for: "event.front_doorbell", id: "front")["trigger"] as? String, "state")
+
+    let binaryOnly = HomeAssistant.discoverDoorbells(devices: devices, entities: Array(entities.dropLast()), states: [],
+                                                    version: "2026.11.0")
+    XCTAssertEqual(binaryOnly.first?.triggers, ["binary_sensor.nvr_doorbell"])
+    XCTAssertEqual(binaryOnly.first?.automationTrigger(for: "binary_sensor.nvr_doorbell", id: "front")["to"] as? String, "on")
   }
 
   @MainActor

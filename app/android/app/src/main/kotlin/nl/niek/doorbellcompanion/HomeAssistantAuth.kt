@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
+import io.flutter.FlutterInjector
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.FormBody
@@ -31,6 +32,7 @@ data class DoorbellInfo(
     val cameraEntityId: String,
     val name: String,
     val ringEntityIds: List<String>,
+    val nativeRingEvents: Set<String> = emptySet(),
 )
 
 object HomeAssistantAuth {
@@ -123,6 +125,7 @@ object HomeAssistantAuth {
                 .remove("ha_refresh_token")
                 .remove("ha_token_expires_at")
                 .remove("ha_doorbells")
+                .remove("ha_doorbell_subscription_synced")
                 .remove("ha_disabled_cameras")
                 .remove("ha_default_camera")
                 .remove("ha_ice_servers")
@@ -428,6 +431,7 @@ object HomeAssistantAuth {
                     .put("camera_entity_id", db.cameraEntityId)
                     .put("name", db.name)
                     .put("ring_entity_ids", JSONArray(db.ringEntityIds))
+                    .put("native_ring_events", JSONArray(db.nativeRingEvents))
             )
         }
 
@@ -496,7 +500,8 @@ object HomeAssistantAuth {
                                 val devices = results[1]?.optJSONArray("result") ?: JSONArray()
                                 val entities = results[2]?.optJSONArray("result") ?: JSONArray()
                                 val states = results[3]?.optJSONArray("result") ?: JSONArray()
-                                val doorbells = parseDoorbells(devices, entities, states)
+                                val version = results[4]?.optJSONObject("result")?.optString("version")
+                                val doorbells = parseDoorbells(devices, entities, states, version)
                                 doorbellsRef.set(doorbells)
 
                                 var nextId = 10
@@ -554,7 +559,9 @@ object HomeAssistantAuth {
         return doorbellsRef.get() to results
     }
 
-    private fun parseDoorbells(devices: JSONArray, entities: JSONArray, states: JSONArray): List<DoorbellInfo> {
+    private fun parseDoorbells(
+        devices: JSONArray, entities: JSONArray, states: JSONArray, version: String?,
+    ): List<DoorbellInfo> {
         val deviceNames = mutableMapOf<String, String>()
         for (i in 0 until devices.length()) {
             val d = devices.optJSONObject(i) ?: continue
@@ -565,12 +572,22 @@ object HomeAssistantAuth {
         }
 
         val friendlyNames = mutableMapOf<String, String>()
+        val ringEvents = mutableSetOf<String>()
         for (i in 0 until states.length()) {
             val s = states.optJSONObject(i) ?: continue
             val eid = s.optString("entity_id")
-            val fn = s.optJSONObject("attributes")?.optString("friendly_name")
+            val attributes = s.optJSONObject("attributes")
+            val fn = attributes?.optString("friendly_name")
             if (eid.isNotBlank() && !fn.isNullOrBlank()) friendlyNames[eid] = fn
+            val eventTypes = attributes?.optJSONArray("event_types") ?: continue
+            if ((0 until eventTypes.length()).any { eventTypes.optString(it) == "ring" }) ringEvents.add(eid)
         }
+
+        // The event.received trigger became available without opting in to Labs in 2026.7.
+        val versionParts = version.orEmpty().split('.')
+        val year = versionParts.first().toIntOrNull() ?: 0
+        val month = versionParts.getOrNull(1)?.toIntOrNull() ?: 0
+        val supportsEventTrigger = year > 2026 || (year == 2026 && month >= 7)
 
         val camerasByDevice = mutableMapOf<String, MutableList<JSONObject>>()
         val ringsByDevice = mutableMapOf<String, MutableList<String>>()
@@ -591,10 +608,14 @@ object HomeAssistantAuth {
                     standaloneCameras.add(e)
                 }
             } else if ((entityId.startsWith("binary_sensor.") || entityId.startsWith("event.")) &&
-                (translationKey == "doorbell" || origClass == "doorbell")
+                (translationKey == "doorbell" || origClass == "doorbell" ||
+                    e.optString("device_class") == "doorbell" || entityId.endsWith("_doorbell"))
             ) {
                 if (deviceId.isNotBlank() && deviceId != "null") {
                     ringsByDevice.getOrPut(deviceId) { mutableListOf() }.add(entityId)
+                    if (entityId.startsWith("event.") && e.optString("platform") == "unifiprotect") {
+                        ringEvents.add(entityId)
+                    }
                 }
             }
         }
@@ -613,9 +634,11 @@ object HomeAssistantAuth {
                 }
             }
             val camId = chosen.optString("entity_id")
-            val preferredRings = ringIds.filter { it.startsWith("binary_sensor.") }.ifEmpty { ringIds }
+            val events = ringIds.filter { it.startsWith("event.") }
+            val preferredRings = events.ifEmpty { ringIds }
+            val nativeEvents = if (supportsEventTrigger) events.filter { it in ringEvents }.toSet() else emptySet()
             val name = deviceNames[deviceId] ?: friendlyNames[camId] ?: camId
-            doorbells.add(DoorbellInfo(camId, name, preferredRings))
+            doorbells.add(DoorbellInfo(camId, name, preferredRings, nativeEvents))
         }
 
         if (doorbells.isEmpty()) {
@@ -637,10 +660,12 @@ object HomeAssistantAuth {
             (0 until arr.length()).mapNotNull { i ->
                 val o = arr.optJSONObject(i) ?: return@mapNotNull null
                 val rings = o.optJSONArray("ring_entity_ids") ?: JSONArray()
+                val nativeEvents = o.optJSONArray("native_ring_events") ?: JSONArray()
                 DoorbellInfo(
                     cameraEntityId = o.optString("camera_entity_id"),
                     name = o.optString("name", "Doorbell"),
                     ringEntityIds = (0 until rings.length()).map { rings.getString(it) },
+                    nativeRingEvents = (0 until nativeEvents.length()).map { nativeEvents.getString(it) }.toSet(),
                 )
             }
         } catch (_: Exception) {
@@ -670,6 +695,9 @@ object HomeAssistantAuth {
         return getSavedDoorbells(context).filter { it.cameraEntityId !in disabled }
     }
 
+    fun needsDoorbellSubscriptionSync(context: Context): Boolean =
+        !prefs(context).getBoolean("ha_doorbell_subscription_synced", false)
+
     /** Picks the explicit push camera if provided, else the first selected doorbell (falling back to the first camera). */
     fun resolveCameraForPush(context: Context, data: Map<String, String>): Pair<String?, String> {
         val directEntity = data["camera_entity_id"]?.takeIf { it.isNotBlank() }
@@ -688,14 +716,16 @@ object HomeAssistantAuth {
         return first?.cameraEntityId to (directName ?: first?.name ?: "Doorbell")
     }
 
-    fun setupPushAutomation(context: Context): String = synchronized(pushLock) {
+    fun setupPushAutomation(context: Context, refreshTriggers: Boolean = false): String = synchronized(pushLock) {
         val p = prefs(context)
         check(!p.contains(PENDING_REVOCATION)) { "Run Disconnect again to finish signing out of Home Assistant" }
         val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
-        val token = getAccessToken(context) ?: error("Not authenticated with Home Assistant")
         val fcmToken = p.getString("fcm_token", null)?.takeIf { it.isNotBlank() }
             ?: error("Firebase token not ready yet")
         val pushUrl = PUSH_RELAY_URL
+        val migrating = p.contains("ha_webhook_id") && needsDoorbellSubscriptionSync(context)
+        if (migrating && !refreshTriggers) discoverDoorbellsAndWarmup(context)
+        val token = getAccessToken(context) ?: error("Not authenticated with Home Assistant")
 
         val devName = deviceName()
         var webhookId = p.getString("ha_webhook_id", null)
@@ -727,84 +757,87 @@ object HomeAssistantAuth {
             Thread.sleep(500)
         }
 
-        val slug = deviceSlug()
-        val notifyService = findMobileAppNotifyService(baseUrl, token, slug) ?: "notify.$slug"
+        val notifyService = "notify.${deviceSlug()}"
         p.edit()
             .putString("ha_webhook_id", webhookId)
             .putString("ha_push_url", pushUrl)
             .putString("ha_notify_service", notifyService)
             .apply()
 
-        val autoId = automationId()
-        val selectedDoorbells = getEnabledDoorbells(context).filter { it.ringEntityIds.isNotEmpty() }
-
-        // If the user unchecked all doorbells, remove the HA automation cleanly so no pushes fire
-        if (selectedDoorbells.isEmpty()) {
-            deleteAutomation(baseUrl, token, autoId)
-            Log.i("DoorbellCompanion", "All doorbells unchecked; removed HA automation $autoId")
-            return@synchronized notifyService
-        }
-
-        val triggers = JSONArray()
-        val chooseBranches = JSONArray()
-        selectedDoorbells.forEachIndexed { idx, db ->
-            val trigId = "db_$idx"
+        syncSharedAutomation(context, baseUrl, token, refreshTriggers || migrating)
+        val routes = JSONObject()
+        for (db in getEnabledDoorbells(context)) {
             for (ringEntity in db.ringEntityIds) {
-                val trig = JSONObject()
-                    .put("trigger", "state")
-                    .put("entity_id", ringEntity)
-                    .put("id", trigId)
-                if (ringEntity.startsWith("binary_sensor.")) {
-                    trig.put("to", "on")
-                } else {
-                    trig.put("not_from", JSONArray().put("unavailable").put("unknown"))
-                    trig.put("not_to", JSONArray().put("unavailable").put("unknown"))
-                }
-                triggers.put(trig)
+                routes.put(ringEntity, JSONObject()
+                    .put("camera_entity_id", db.cameraEntityId)
+                    .put("doorbell_name", db.name))
             }
-            chooseBranches.put(
-                JSONObject()
-                    .put("conditions", JSONArray().put(JSONObject().put("condition", "trigger").put("id", trigId)))
-                    .put(
-                        "sequence",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("action", notifyService)
-                                .put(
-                                    "data",
-                                    JSONObject()
-                                        .put("title", db.name)
-                                        .put("message", "Someone is at the door")
-                                        .put(
-                                            "data",
-                                            JSONObject()
-                                                .put("type", "doorbell_ring")
-                                                .put("camera_entity_id", db.cameraEntityId)
-                                                .put("doorbell_name", db.name)
-                                        )
-                                )
-                        )
-                    )
-            )
         }
+        val subscription = JSONObject().put("service", notifyService).put("doorbells", routes)
+        val sensor = JSONObject()
+            .put("type", "sensor")
+            .put("unique_id", "doorbell_companion_subscription")
+            .put("name", "Doorbell subscription")
+            .put("entity_category", "diagnostic")
+            .put("state", routes.length())
+            .put("attributes", JSONObject().put("doorbell_companion_subscription", subscription))
+        val command = JSONObject().put("type", "register_sensor").put("data", sensor)
+        val request = Request.Builder().url("$baseUrl/api/webhook/$webhookId")
+            .post(command.toString().toRequestBody(jsonMedia)).build()
+        httpClient.newCall(request).execute().use { response ->
+            val result = runCatching { JSONObject(response.body?.string().orEmpty()) }.getOrNull()
+            check(response.isSuccessful && result?.optBoolean("success") == true) {
+                "Home Assistant could not save this phone's doorbell subscriptions"
+            }
+        }
+        deleteAutomation(baseUrl, token, automationId())
+        p.edit().putBoolean("ha_doorbell_subscription_synced", true).apply()
+        notifyService
+    }
 
-        val automationConfig = JSONObject()
-            .put("id", autoId)
-            .put("alias", "Doorbell Companion: Doorbell Call (${Build.MODEL})")
-            .put("description", "Sends doorbell call notifications to Doorbell Companion")
-            .put("mode", "parallel")
-            .put("triggers", triggers)
-            .put("conditions", JSONArray())
-            .put("actions", JSONArray().put(JSONObject().put("choose", chooseBranches)))
-
-        val autoReq = haRequest(baseUrl, token, "/api/config/automation/config/$autoId")
-            .post(automationConfig.toString().toRequestBody(jsonMedia))
-            .build()
-        httpClient.newCall(autoReq).execute().use { resp ->
+    private fun syncSharedAutomation(context: Context, baseUrl: String, token: String, refreshTriggers: Boolean) {
+        val asset = FlutterInjector.instance().flutterLoader().getLookupKeyForAsset("assets/doorbell_automation.json")
+        val config = context.assets.open(asset).bufferedReader().use { JSONObject(it.readText()) }
+        val path = "/api/config/automation/config/${config.getString("id")}"
+        val existing = httpClient.newCall(haRequest(baseUrl, token, path).get().build()).execute().use { resp ->
+            val data = resp.body?.string().orEmpty()
+            when {
+                resp.isSuccessful -> JSONObject(data)
+                resp.code == 404 || (resp.code == 400 && JSONObject(data).optString("message") == "Resource not found") -> null
+                else -> error("Could not read the shared Home Assistant automation (HTTP ${resp.code})")
+            }
+        }
+        if (!refreshTriggers && existing != null) return
+        val triggers = config.getJSONArray("triggers")
+        val ringTriggers = sortedMapOf<String, JSONObject>()
+        for (db in getSavedDoorbells(context)) {
+            for (ringEntity in db.ringEntityIds) {
+                val trig = JSONObject().put("id", ringEntity)
+                if (ringEntity in db.nativeRingEvents) {
+                    trig.put("trigger", "event.received")
+                    trig.put("target", JSONObject().put("entity_id", ringEntity))
+                    trig.put("options", JSONObject().put("event_type", JSONArray().put("ring")))
+                } else {
+                    trig.put("trigger", "state").put("entity_id", ringEntity)
+                    if (ringEntity.startsWith("binary_sensor.")) {
+                        trig.put("to", "on")
+                    } else {
+                        trig.put("not_from", JSONArray().put("unavailable").put("unknown"))
+                        trig.put("not_to", JSONArray().put("unavailable").put("unknown"))
+                    }
+                }
+                ringTriggers[ringEntity] = trig
+            }
+        }
+        if (ringTriggers.isEmpty() && existing != null) return
+        ringTriggers.values.forEach { triggers.put(it) }
+        if (existing != null && config.keys().asSequence().all {
+                it == "id" || config.opt(it).toString() == existing.opt(it).toString()
+            }) return
+        val request = haRequest(baseUrl, token, path).post(config.toString().toRequestBody(jsonMedia)).build()
+        httpClient.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) error("Could not save HA automation (HTTP ${resp.code})")
         }
-        Log.i("DoorbellCompanion", "HA automation synced (${selectedDoorbells.size} doorbells) -> $notifyService")
-        notifyService
     }
 
     fun sendTestPushViaHa(context: Context, camera: String? = null) {
@@ -880,25 +913,6 @@ object HomeAssistantAuth {
             valid
         }
     }
-
-    private fun findMobileAppNotifyService(baseUrl: String, token: String, expectedSlug: String): String? =
-        try {
-            httpClient.newCall(haRequest(baseUrl, token, "/api/services").get().build()).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val domains = JSONArray(resp.body?.string() ?: "[]")
-                for (i in 0 until domains.length()) {
-                    val d = domains.optJSONObject(i) ?: continue
-                    if (d.optString("domain") != "notify") continue
-                    val services = d.optJSONObject("services") ?: continue
-                    if (services.has(expectedSlug)) return "notify.$expectedSlug"
-                    val match = services.keys().asSequence().firstOrNull { it.startsWith("mobile_app_doorbell_companion") }
-                    if (match != null) return "notify.$match"
-                }
-                null
-            }
-        } catch (_: Exception) {
-            null
-        }
 
     private fun sanitizeSlug(raw: String): String = raw.lowercase().replace(nonAlnum, "_").trim('_')
     private fun deviceName(): String = "Doorbell Companion ${Build.MODEL}"

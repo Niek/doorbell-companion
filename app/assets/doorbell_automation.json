@@ -1,0 +1,69 @@
+{
+  "id": "doorbell_companion_doorbell_call",
+  "alias": "Doorbell Companion: Doorbell Call",
+  "description": "Sends a call to each phone subscribed to the doorbell that rang.",
+  "mode": "parallel",
+  "max": 100,
+  "triggers": [
+    {
+      "trigger": "event",
+      "event_type": "doorbell_companion_send_call",
+      "id": "send_call"
+    }
+  ],
+  "actions": [
+    {
+      "choose": [
+        {
+          "conditions": "{{ trigger.id | default('') == 'send_call' }}",
+          "sequence": [
+            {
+              "condition": "template",
+              "value_template": "{{ trigger.event.data.service is match('^notify[.]mobile_app_doorbell_companion_[a-z0-9_]+$') }}"
+            },
+            {
+              "action": "{{ trigger.event.data.service }}",
+              "continue_on_error": true,
+              "data": {
+                "title": "{{ trigger.event.data.doorbell.doorbell_name }}",
+                "message": "Someone is at the door",
+                "data": {
+                  "type": "doorbell_ring",
+                  "camera_entity_id": "{{ trigger.event.data.doorbell.camera_entity_id }}",
+                  "doorbell_name": "{{ trigger.event.data.doorbell.doorbell_name }}"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": [
+        {
+          "variables": {
+            "subscriptions": "{{ integration_entities('mobile_app') | select('match', '^sensor[.]') | map('state_attr', 'doorbell_companion_subscription') | select('mapping') | list }}",
+            "legacy_automations": "{{ states.automation | selectattr('state', 'eq', 'on') | map(attribute='attributes.id') | select('defined') | list }}"
+          }
+        },
+        {
+          "repeat": {
+            "for_each": "{{ subscriptions }}",
+            "sequence": [
+              {
+                "if": "{{ trigger.id | default('') in repeat.item.doorbells and repeat.item.service | replace('notify.mobile_app_', '', 1) not in legacy_automations }}",
+                "then": [
+                  {
+                    "event": "doorbell_companion_send_call",
+                    "event_data": {
+                      "service": "{{ repeat.item.service }}",
+                      "doorbell": "{{ repeat.item.doorbells[trigger.id] }}"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
