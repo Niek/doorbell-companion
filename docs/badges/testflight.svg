@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="166" height="44" viewBox="0 0 166 44">
+  <title>Join the TestFlight beta</title>
+  <rect x="0.5" y="0.5" width="165" height="43" rx="8" fill="#172132" stroke="#53657e"/>
+  <g fill="none" stroke="#a6caff" stroke-width="1.8" stroke-linejoin="round">
+    <path d="m13 21 20-9-7 20-4-8z"/>
+    <path d="m22 24 11-12"/>
+  </g>
+  <g font-family="Arial, sans-serif" fill="#fff">
+    <text x="43" y="17" font-size="10" fill="#d4deed">Join the iOS beta</text>
+    <text x="43" y="34" font-size="17" font-weight="bold">TestFlight</text>
+  </g>
+</svg>

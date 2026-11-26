@@ -47,6 +47,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Doorbell Companion uses the WebRTC video library to display live video from your doorbell camera.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Talk to visitors when you answer a doorbell call.</string>
 	<key>UIBackgroundModes</key>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="166" height="44" viewBox="0 0 166 44">
+  <title>Join the Google Play open test</title>
+  <rect x="0.5" y="0.5" width="165" height="43" rx="8" fill="#17211d" stroke="#54655d"/>
+  <path d="M15 12v20l17-10z" fill="none" stroke="#9ee6b5" stroke-width="1.8" stroke-linejoin="round"/>
+  <g font-family="Arial, sans-serif" fill="#fff">
+    <text x="43" y="17" font-size="10" fill="#d3dfd7">Join the open test</text>
+    <text x="43" y="34" font-size="17" font-weight="bold">Google Play</text>
+  </g>
+</svg>

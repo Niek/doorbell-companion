@@ -10,6 +10,15 @@
 
 Most doorbell notifications arrive late and open a slow camera view. Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, the native CallKit screen on iOS. The camera connects while it's still ringing, so video and audio are live the moment you answer. Works with any Home Assistant doorbell, including UniFi Protect.
 
+## Test builds
+
+<p>
+  <a href="https://play.google.com/apps/testing/nl.niek.doorbellcompanion"><img src="docs/badges/google-play.svg" height="44" alt="Join the Google Play open test for Android"></a>
+  <a href="https://testflight.apple.com/join/tQCjCUU6"><img src="docs/badges/testflight.svg" height="44" alt="Join the TestFlight beta for iPhone and iPad"></a>
+</p>
+
+Google Play enrollment requires a published open-test build. TestFlight enrollment requires a build approved for external testing.
+
 ## Features
 
 - **Built for speed.** High-priority FCM and VoIP pushes ring the phone straight away. A snapshot shows instantly, WebRTC takes over at the first frame, and local and remote addresses are tried in parallel.
