@@ -96,6 +96,7 @@ class DoorbellCompanionController extends ChangeNotifier {
   String? oauthError;
   String? oauthUrl;
   bool refreshing = false;
+  bool disconnecting = false;
   /// Camera whose test ring is scheduled, if any.
   String? testPushCamera;
 
@@ -214,17 +215,21 @@ class DoorbellCompanionController extends ChangeNotifier {
   }
 
   Future<String?> disconnect() async {
+    disconnecting = true;
+    notifyListeners();
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>('disconnect');
       if (raw != null) status = AppStatus.fromMap(raw);
+      discovered = const [];
+      oauthError = null;
+      await startDiscovery();
+      return null;
     } on PlatformException catch (e) {
       return e.message ?? 'Could not disconnect';
+    } finally {
+      disconnecting = false;
+      notifyListeners();
     }
-    discovered = const [];
-    oauthError = null;
-    await startDiscovery();
-    notifyListeners();
-    return null;
   }
 
   Future<String?> testCall(String camera) async {
@@ -835,7 +840,7 @@ class SettingsScreen extends StatelessWidget {
           icon: const Icon(Icons.logout),
           title: const Text('Disconnect Home Assistant?'),
           content: const Text(
-            'This removes the Doorbell Companion automation from Home Assistant and signs out on this phone.',
+            'This removes the ring automation and phone registration from Home Assistant and revokes this phone’s sign-in session.',
           ),
           actions: [
             TextButton(
@@ -885,7 +890,7 @@ class SettingsScreen extends StatelessWidget {
                     )
                   : const Icon(Icons.refresh),
               tooltip: 'Sync with Home Assistant',
-              onPressed: controller.refreshing
+              onPressed: controller.refreshing || controller.disconnecting
                   ? null
                   : () async {
                       final err = await controller.refreshDoorbells();
@@ -915,10 +920,12 @@ class SettingsScreen extends StatelessWidget {
                     for (final db in st.doorbells)
                       SwitchListTile(
                         value: db.enabled,
-                        onChanged: (val) async {
-                          final err = await controller.setDoorbellEnabled(db.cameraEntityId, val);
-                          if (err != null && context.mounted) _showMessage(context, err);
-                        },
+                        onChanged: controller.disconnecting
+                            ? null
+                            : (val) async {
+                                final err = await controller.setDoorbellEnabled(db.cameraEntityId, val);
+                                if (err != null && context.mounted) _showMessage(context, err);
+                              },
                         secondary: Icon(Icons.doorbell_outlined),
                         title: Text(db.name),
                         subtitle: Text(
@@ -977,9 +984,12 @@ class SettingsScreen extends StatelessWidget {
                     onTap: () => controller.openUrl('https://my.home-assistant.io/redirect/config/'),
                   ),
                   ListTile(
-                    leading: Icon(Icons.logout),
-                    title: Text('Disconnect', style: TextStyle(color: scheme.error)),
-                    onTap: () => _confirmDisconnect(context),
+                    leading: controller.disconnecting
+                        ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.logout),
+                    title: Text(controller.disconnecting ? 'Disconnecting…' : 'Disconnect',
+                        style: TextStyle(color: scheme.error)),
+                    onTap: controller.disconnecting ? null : () => _confirmDisconnect(context),
                   ),
                 ],
               ),

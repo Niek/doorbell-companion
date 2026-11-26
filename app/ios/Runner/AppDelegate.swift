@@ -14,6 +14,7 @@ import UIKit
   private var authentication: ASWebAuthenticationSession?
   private var oauthState: String?
   private var syncTask: Task<Void, Never>?
+  private var disconnecting = false
   private var testPushTask: Task<Void, Never>?
   private var pushSetupError: String?
   private var pushReady = false
@@ -80,7 +81,13 @@ import UIKit
       }
       result(status())
     case "disconnect":
+      guard !disconnecting else {
+        result(flutterError(DoorbellCompanionError("Already disconnecting from Home Assistant")))
+        return
+      }
+      disconnecting = true
       Task {
+        defer { disconnecting = false }
         do {
           testPushTask?.cancel()
           await syncTask?.value
@@ -88,7 +95,13 @@ import UIKit
           pushReady = false
           pushSetupError = nil
           result(status())
-        } catch { result(flutterError(error)) }
+        } catch {
+          if home.pendingDisconnect {
+            pushReady = false
+            publishStatus()
+          }
+          result(flutterError(error))
+        }
       }
     case "testCall":
       guard let bell = home.selectedDoorbell(camera: arguments["camera"] as? String) else {
@@ -165,7 +178,7 @@ import UIKit
     let previous = syncTask
     syncTask = Task { [weak self] in
       await previous?.value
-      guard let self else { return }
+      guard let self, !disconnecting, !home.pendingDisconnect else { return }
       guard home.url != nil, let token = calls.pushToken else {
         pushReady = false
         publishStatus()

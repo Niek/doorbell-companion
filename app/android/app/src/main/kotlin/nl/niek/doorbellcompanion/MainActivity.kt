@@ -145,8 +145,14 @@ class MainActivity : FlutterActivity() {
 
                 "disconnect" -> {
                     main.removeCallbacks(syncAutomationRunnable)
-                    HomeAssistantAuth.disconnect(this)
-                    result.success(buildStatusMap())
+                    syncExecutor.execute {
+                        try {
+                            HomeAssistantAuth.disconnect(applicationContext)
+                            main.post { result.success(buildStatusMap()) }
+                        } catch (e: Exception) {
+                            main.post { result.error("DISCONNECT_FAILED", e.message ?: "Could not disconnect", null) }
+                        }
+                    }
                 }
 
                 "openUrl" -> {

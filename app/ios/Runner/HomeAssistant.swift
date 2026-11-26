@@ -30,6 +30,7 @@ struct HACredentials: Codable {
   let refreshToken: String
   var accessToken: String
   var expiration: Date
+  var pendingRevocation: URL?
 }
 
 @MainActor
@@ -57,6 +58,7 @@ final class HomeAssistant {
   private let deviceID: String
 
   var url: URL? { credentials?.url }
+  var pendingDisconnect: Bool { credentials?.pendingRevocation != nil }
   var endpoints: [URL] {
     var urls = [localURL, externalURL, url].compactMap { $0 }
     var seen = Set<URL>()
@@ -169,12 +171,12 @@ final class HomeAssistant {
     return try await task.value
   }
 
-  func authorizedSocket(at endpoint: URL, token: String) async throws -> HASocket {
-    try await authorizedSocket(at: endpoint) { token }
+  func authorizedSocket(at endpoint: URL, token: String, session: URLSession? = nil) async throws -> HASocket {
+    try await authorizedSocket(at: endpoint, session: session) { token }
   }
 
-  func authorizedSocket(at endpoint: URL, token: () async throws -> String) async throws -> HASocket {
-    let socket = HASocket(baseURL: endpoint, session: webSockets)
+  func authorizedSocket(at endpoint: URL, session: URLSession? = nil, token: () async throws -> String) async throws -> HASocket {
+    let socket = HASocket(baseURL: endpoint, session: session ?? webSockets)
     do {
       guard try await socket.receive()["type"] as? String == "auth_required" else {
         throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
@@ -392,22 +394,111 @@ final class HomeAssistant {
   }
 
   func disconnect() async throws {
-    if url != nil, deviceRegistration != nil {
-      let token = try await accessToken()
-      let endpoint = try await reachableEndpoint(token: token)
-      _ = try await request(at: endpoint, path: "api/config/automation/config/\(automationID)",
-                            token: token, method: "DELETE", allowMissing: true)
+    guard let credentials else { return }
+    let endpoint: URL
+    if let pending = credentials.pendingRevocation {
+      endpoint = pending
+    } else {
+      let token = try await accessToken(forceRefresh: true)
+      endpoint = try await reachableEndpoint(token: token)
+      let entryID = try await registrationEntryID(at: endpoint, token: token)
+      try await deleteAtDisconnect(at: endpoint, token: token,
+        path: "api/config/automation/config/\(automationID)", item: "doorbell automation")
+      if let entryID {
+        try await deleteAtDisconnect(at: endpoint, token: token,
+          path: "api/config/config_entries/entry/\(entryID)", item: "phone registration")
+      }
+      // The server may already have revoked the token when a retry runs.
+      var pending = self.credentials ?? credentials
+      pending.pendingRevocation = endpoint
+      try Self.saveCredentials(pending)
+      self.credentials = pending
+    }
+
+    guard await revokeSession(at: [endpoint] + endpoints.filter { $0 != endpoint }, token: credentials.refreshToken) else {
+      throw DoorbellCompanionError("Could not revoke the Home Assistant session. Check the connection and try Disconnect again.")
+    }
+    let status = SecItemDelete(Self.keychainQuery as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw DoorbellCompanionError("Could not clear this phone's Home Assistant sign-in. Try Disconnect again.")
     }
     refreshTask?.cancel()
-    credentials = nil
-    SecItemDelete(Self.keychainQuery as CFDictionary)
+    self.credentials = nil
     doorbells = []
     localURL = nil
     externalURL = nil
-    // Keep the existing HA registration for a reconnect to the same server.
-    for key in ["doorbells", "local_url", "external_url", "synced_automation"] {
+    deviceRegistration = nil
+    registeredPushToken = nil
+    registrationServer = nil
+    for key in ["doorbells", "local_url", "external_url", "synced_automation", "registration",
+                "registered_push_token", "registration_server"] {
       defaults.removeObject(forKey: key)
     }
+  }
+
+  private func registrationEntryID(at endpoint: URL, token: String) async throws -> String? {
+    var hassDeviceID: String?
+    if let registration = deviceRegistration {
+      do {
+        let data = try await request(at: endpoint, path: "api/webhook/\(registration)", json: ["type": "get_config"])
+        if !data.isEmpty {
+          let config = try? JSONSerialization.jsonObject(with: data) as? JSON
+          guard let id = config?["hass_device_id"] as? String, !id.isEmpty else {
+            throw DoorbellCompanionError("Home Assistant did not identify the phone registration")
+          }
+          hassDeviceID = id
+        }
+      } catch let error as HAHTTPError where error.status == 404 || error.status == 410 {
+        // Home Assistant may have removed the registration already.
+      }
+    }
+    let socket = try await authorizedSocket(at: endpoint, token: token, session: session)
+    defer { socket.close() }
+    guard let devices = try await socket.command("config/device_registry/list") as? [JSON] else {
+      throw DoorbellCompanionError("Could not read the Home Assistant device registry")
+    }
+    let matching = devices.filter { device in
+      (device["identifiers"] as? [[String]])?.contains(["mobile_app", deviceID]) == true
+    }
+    if hassDeviceID == nil, matching.isEmpty { return nil }
+    guard let hassDeviceID, let device = matching.first(where: { $0["id"] as? String == hassDeviceID }) else {
+      throw DoorbellCompanionError("Could not verify that the Home Assistant registration belongs to this phone")
+    }
+    let entries = device["config_entries"] as? [String]
+    let entryID = entries.map { $0.count == 1 ? $0[0] : "" } ?? device["config_entry_id"] as? String
+    guard let entryID, !entryID.isEmpty else {
+      throw DoorbellCompanionError("Could not identify the phone's Mobile App entry in Home Assistant")
+    }
+    return entryID
+  }
+
+  private func deleteAtDisconnect(at endpoint: URL, token: String, path: String, item: String) async throws {
+    do {
+      _ = try await request(at: endpoint, path: path, token: token, method: "DELETE", allowMissing: true)
+    } catch let error as HAHTTPError where error.status == 401 || error.status == 403 {
+      throw DoorbellCompanionError("A Home Assistant administrator must remove the \(item)")
+    } catch {
+      throw DoorbellCompanionError("Could not remove the \(item). \(error.localizedDescription)")
+    }
+  }
+
+  private func revokeSession(at endpoints: [URL], token: String) async -> Bool {
+    for endpoint in endpoints {
+      do {
+        let request = formRequest(at: endpoint, path: "auth/revoke", fields: ["token": token])
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if status == 200, data.isEmpty { return true }
+        if status == 404 || status == 405 {
+          let legacy = formRequest(at: endpoint, path: "auth/token", fields: ["token": token, "action": "revoke"])
+          let (data, response) = try await session.data(for: legacy)
+          if (response as? HTTPURLResponse)?.statusCode == 200, data.isEmpty { return true }
+        }
+      } catch {
+        if Task.isCancelled { return false }
+      }
+    }
+    return false
   }
 
   private func reachableEndpoint(token: String) async throws -> URL {
@@ -443,21 +534,29 @@ final class HomeAssistant {
     }
     let (data, response) = try await session.data(for: request)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-    guard (200..<300).contains(status) || (allowMissing && status == 404) else {
+    // The automation editor returns 400 for an automation that is already absent.
+    let missingAutomation = allowMissing && status == 400 && path.hasPrefix("api/config/automation/") &&
+      (try? JSONSerialization.jsonObject(with: data) as? JSON)?["message"] as? String == "Resource not found"
+    guard (200..<300).contains(status) || (allowMissing && status == 404) || missingAutomation else {
       // Webhook IDs are credentials. Avoid including the request URL in an error.
       throw HAHTTPError(status: status, path: path.hasPrefix("api/webhook/") ? "registration" : path)
     }
     return data
   }
 
-  private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
-    var request = URLRequest(url: url.appendingPathComponent("auth/token"), timeoutInterval: 8)
+  private func formRequest(at url: URL, path: String, fields: [String: String]) -> URLRequest {
+    var request = URLRequest(url: url.appendingPathComponent(path), timeoutInterval: 8)
     request.httpMethod = "POST"
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
     request.httpBody = Data(fields.map { key, value in
       "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")"
     }.joined(separator: "&").utf8)
+    return request
+  }
+
+  private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
+    let request = formRequest(at: url, path: "auth/token", fields: fields)
     let (data, response) = try await session.data(for: request)
     guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
           let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
