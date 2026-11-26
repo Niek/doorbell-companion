@@ -2,23 +2,19 @@
 
 <h1 align="center">Doorbell Companion</h1>
 
-<p align="center">Doorbell rings become phone calls with live video, for Home Assistant on Android and iOS.</p>
+<p align="center">From doorbell press to talking with your visitor in under a second.<br>Live video calls for Home Assistant doorbells on Android and iOS.</p>
 
 <p align="center">
-  <img src="docs/screenshots/call.jpg" width="250" alt="Call screen with live doorbell video">
-  &nbsp;
-  <img src="docs/screenshots/home.png" width="250" alt="Home screen showing three doorbells ready for calls">
-  &nbsp;
-  <img src="docs/screenshots/settings.png" width="250" alt="Settings with a switch per doorbell">
+  <img src="docs/screenshots/call.jpg" width="300" alt="Call screen with live doorbell video">
 </p>
 
-When someone rings, your phone shows an incoming call: a full-screen call on Android, the native CallKit screen on iOS. The camera starts connecting while it rings, so video is live by the time you answer. Works with any Home Assistant doorbell, including UniFi Protect.
+Most doorbell notifications arrive late and open a slow camera view. Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, the native CallKit screen on iOS. The camera connects while it's still ringing, so video and audio are live the moment you answer. Works with any Home Assistant doorbell, including UniFi Protect.
 
 ## Features
 
-- **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the ring automation for you.
-- **Fast video.** Shows a snapshot right away and switches to WebRTC as soon as the first frame arrives. Local and remote addresses are tried in parallel.
+- **Built for speed.** High-priority FCM and VoIP pushes ring the phone straight away. A snapshot shows instantly, WebRTC takes over at the first frame, and local and remote addresses are tried in parallel.
 - **Talkback.** Hear visitors, and talk back when the camera supports two-way audio.
+- **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the ring automation for you.
 - **Multiple doorbells.** Turn each one on or off in Settings.
 
 ## How it works
@@ -59,6 +55,8 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 4. Under a doorbell, tap **View** to check the camera, then **Test ring** and lock your phone within 3 seconds.
 
 Moving from a build with an older app ID? Disconnect that one first to avoid double rings.
+
+Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the ring automation and Mobile App registration and revokes this phone’s Home Assistant session. Uninstalling alone leaves the Home Assistant setup in place.
 
 ## Self-hosting the relay
 
