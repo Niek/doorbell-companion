@@ -46,7 +46,6 @@ class AppStatus {
     this.haConnected = false,
     this.haUrl = '',
     this.doorbells = const [],
-    this.firstCameraName = '',
     this.notificationsGranted = true,
     this.microphoneGranted = false,
     this.fullScreenGranted = true,
@@ -57,7 +56,6 @@ class AppStatus {
   final bool haConnected;
   final String haUrl;
   final List<DoorbellItem> doorbells;
-  final String firstCameraName;
   final bool notificationsGranted;
   final bool microphoneGranted;
   final bool fullScreenGranted;
@@ -75,7 +73,6 @@ class AppStatus {
           .whereType<Map<Object?, Object?>>()
           .map(DoorbellItem.fromMap)
           .toList(),
-      firstCameraName: (map['firstCameraName'] as String?) ?? '',
       notificationsGranted: map['notificationsGranted'] != false,
       microphoneGranted: map['microphoneGranted'] == true,
       fullScreenGranted: map['fullScreenGranted'] != false,
@@ -99,7 +96,8 @@ class DoorbellCompanionController extends ChangeNotifier {
   String? oauthError;
   String? oauthUrl;
   bool refreshing = false;
-  bool testPushPending = false;
+  /// Camera whose test ring is scheduled, if any.
+  String? testPushCamera;
 
   Future<dynamic> _handleNativeCall(MethodCall call) async {
     switch (call.method) {
@@ -229,26 +227,26 @@ class DoorbellCompanionController extends ChangeNotifier {
     return null;
   }
 
-  Future<String?> testCall() async {
+  Future<String?> testCall(String camera) async {
     try {
-      await _channel.invokeMethod('testCall');
+      await _channel.invokeMethod('testCall', {'camera': camera});
       return null;
     } on PlatformException catch (e) {
-      return e.message ?? 'Could not start the test call';
+      return e.message ?? 'Could not open the camera';
     }
   }
 
-  Future<String?> testRemotePush() async {
-    if (testPushPending) return null;
-    testPushPending = true;
+  Future<String?> testRemotePush(String camera) async {
+    if (testPushCamera != null) return null;
+    testPushCamera = camera;
     notifyListeners();
     try {
-      await _channel.invokeMethod('testRemotePush');
+      await _channel.invokeMethod('testRemotePush', {'camera': camera});
       return null;
     } on PlatformException catch (e) {
-      return e.message ?? 'Could not send the test call';
+      return e.message ?? 'Could not send the test ring';
     } finally {
-      testPushPending = false;
+      testPushCamera = null;
       notifyListeners();
     }
   }
@@ -664,8 +662,8 @@ class _ConnectedBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final st = controller.status;
-    final hasDoorbell = st.doorbells.isNotEmpty;
-    final cameraName = st.firstCameraName.isNotEmpty ? st.firstCameraName : 'your doorbell';
+    final enabled = st.doorbells.where((d) => d.enabled).toList();
+    final canRing = st.pushReady != false && controller.testPushCamera == null;
 
     return RefreshIndicator(
       onRefresh: () => _refresh(context),
@@ -704,44 +702,120 @@ class _ConnectedBody extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 28),
-          const _SectionHeader('Test'),
-          _DividedCard(
-            children: [
-              ListTile(
-                enabled: hasDoorbell,
-                leading: const Icon(Icons.videocam_outlined),
-                title: const Text('Test call'),
-                subtitle: Text('Open the call screen for $cameraName'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () async {
-                  final err = await controller.testCall();
+          const _SectionHeader('Doorbells'),
+          if (enabled.isEmpty)
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.doorbell_outlined),
+                title: Text(st.doorbells.isEmpty ? 'No doorbells found' : 'No doorbells turned on'),
+                subtitle: Text(
+                  st.doorbells.isEmpty
+                      ? 'Pull down to search Home Assistant again'
+                      : 'Turn one on in Settings to test it here',
+                ),
+              ),
+            )
+          else ...[
+            for (final db in enabled) ...[
+              _DoorbellCard(
+                doorbell: db,
+                ringing: controller.testPushCamera == db.cameraEntityId,
+                canRing: canRing,
+                onView: () async {
+                  final err = await controller.testCall(db.cameraEntityId);
+                  if (err != null && context.mounted) _showMessage(context, err);
+                },
+                onTestRing: () async {
+                  final err = await controller.testRemotePush(db.cameraEntityId);
                   if (err != null && context.mounted) _showMessage(context, err);
                 },
               ),
-              ListTile(
-                enabled: hasDoorbell && st.pushReady != false && !controller.testPushPending,
-                leading: Icon(Icons.notifications_active_outlined),
-                title: const Text('Test push'),
-                subtitle: Text(
-                  controller.testPushPending
-                      ? 'Ringing in 3 seconds — lock your phone now'
-                      : 'Rings through Home Assistant after 3 seconds',
-                ),
-                trailing: controller.testPushPending
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2.2),
-                      )
-                    : const Icon(Icons.chevron_right),
-                onTap: () async {
-                  final error = await controller.testRemotePush();
-                  if (error != null && context.mounted) _showMessage(context, error);
-                },
-              ),
+              const SizedBox(height: 12),
             ],
-          ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Text(
+                'Test ring calls this phone through Home Assistant after 3 seconds. '
+                'Lock your phone to see it the way a real ring arrives.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+class _DoorbellCard extends StatelessWidget {
+  const _DoorbellCard({
+    required this.doorbell,
+    required this.ringing,
+    required this.canRing,
+    required this.onView,
+    required this.onTestRing,
+  });
+
+  final DoorbellItem doorbell;
+  final bool ringing;
+  final bool canRing;
+  final VoidCallback onView;
+  final VoidCallback onTestRing;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.doorbell_outlined),
+              title: Text(doorbell.name),
+              subtitle: Text(
+                ringing
+                    ? 'Ringing in 3 seconds…'
+                    : doorbell.cameraEntityId.replaceFirst('camera.', ''),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: ringing
+                    ? null
+                    : theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: OverflowBar(
+                alignment: MainAxisAlignment.end,
+                spacing: 8,
+                overflowSpacing: 8,
+                overflowAlignment: OverflowBarAlignment.end,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: canRing ? onTestRing : null,
+                    icon: ringing
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.notifications_active_outlined),
+                    label: const Text('Test ring'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: onView,
+                    icon: const Icon(Icons.videocam_outlined),
+                    label: const Text('View'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

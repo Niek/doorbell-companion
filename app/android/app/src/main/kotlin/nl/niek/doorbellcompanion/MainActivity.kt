@@ -157,7 +157,11 @@ class MainActivity : FlutterActivity() {
 
                 "testCall" -> {
                     CallTiming.start(System.currentTimeMillis().toString())
-                    val (camId, doorbellName) = HomeAssistantAuth.resolveCameraForPush(this, emptyMap())
+                    val camera = call.argument<String>("camera").orEmpty()
+                    val (camId, doorbellName) = HomeAssistantAuth.resolveCameraForPush(
+                        this,
+                        mapOf("camera_entity_id" to camera),
+                    )
                     HomeAssistantAuth.prefs(this).edit()
                         .putString("last_doorbell_name", doorbellName)
                         .apply { if (camId != null) putString("last_ha_camera", camId) }
@@ -175,10 +179,11 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "testRemotePush" -> {
+                    val camera = call.argument<String>("camera")
                     HomeAssistantAuth.ioExecutor.execute {
                         try {
                             Thread.sleep(3_000L)
-                            HomeAssistantAuth.sendTestPushViaHa(applicationContext)
+                            HomeAssistantAuth.sendTestPushViaHa(applicationContext, camera)
                             main.post { result.success(null) }
                         } catch (e: Exception) {
                             Log.w("DoorbellCompanion", "Remote test push failed: ${e.message}")
@@ -276,7 +281,6 @@ class MainActivity : FlutterActivity() {
                 "enabled" to (db.cameraEntityId !in disabled),
             )
         }
-        val firstCameraName = (doorbells.firstOrNull { it.cameraEntityId !in disabled } ?: doorbells.firstOrNull())?.name ?: ""
         // Covers the runtime permission and the app-level switch in system settings.
         val notifGranted = getSystemService(NotificationManager::class.java).areNotificationsEnabled()
         val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -288,7 +292,6 @@ class MainActivity : FlutterActivity() {
             "haConnected" to haConnected,
             "haUrl" to haUrl,
             "doorbells" to doorbellMaps,
-            "firstCameraName" to firstCameraName,
             "notificationsGranted" to notifGranted,
             "microphoneGranted" to micGranted,
             "fullScreenGranted" to fullScreenGranted,

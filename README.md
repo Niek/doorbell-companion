@@ -56,7 +56,7 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 1. Open the app on your home Wi-Fi and pick your Home Assistant, or enter its URL.
 2. Sign in. The app finds your doorbells and creates the automation.
 3. Allow notifications, and on Android full-screen calls. Allow the microphone for talkback.
-4. Tap **Test call**, then **Test push** and lock your phone within 3 seconds.
+4. Under a doorbell, tap **View** to check the camera, then **Test ring** and lock your phone within 3 seconds.
 
 Moving from a build with an older app ID? Disconnect that one first to avoid double rings.
 

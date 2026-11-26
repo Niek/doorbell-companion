@@ -705,13 +705,13 @@ object HomeAssistantAuth {
         return notifyService
     }
 
-    fun sendTestPushViaHa(context: Context) {
+    fun sendTestPushViaHa(context: Context, camera: String? = null) {
         val baseUrl = getBaseUrl(context) ?: error("Home Assistant not configured")
         val token = getAccessToken(context) ?: error("Not authenticated")
         val notifyService = prefs(context).getString("ha_notify_service", null)?.takeIf { it.isNotBlank() }
             ?: setupPushAutomation(context)
         val serviceSlug = notifyService.removePrefix("notify.")
-        val (camId, name) = resolveCameraForPush(context, emptyMap())
+        val (camId, name) = resolveCameraForPush(context, mapOf("camera_entity_id" to camera.orEmpty()))
         val payload = JSONObject()
             .put("title", name)
             .put("message", "Someone is at the door")

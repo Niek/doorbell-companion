@@ -91,10 +91,15 @@ import UIKit
         } catch { result(flutterError(error)) }
       }
     case "testCall":
-      if let bell = home.selectedDoorbell() { calls.test(bell) }
+      guard let bell = home.selectedDoorbell(camera: arguments["camera"] as? String) else {
+        result(flutterError(DoorbellCompanionError("This doorbell is no longer available")))
+        return
+      }
+      calls.test(bell)
       result(nil)
     case "testRemotePush":
-      guard calls.pushToken != nil, let bell = home.selectedDoorbell() else {
+      guard calls.pushToken != nil,
+            let bell = home.selectedDoorbell(camera: arguments["camera"] as? String) else {
         result(flutterError(DoorbellCompanionError("A registered iPhone and an enabled doorbell are required")))
         return
       }
@@ -145,7 +150,6 @@ import UIKit
     var value: JSON = [
       "haConnected": home.url != nil, "haUrl": home.url?.absoluteString ?? "",
       "doorbells": home.doorbells.map(\.flutterValue),
-      "firstCameraName": home.selectedDoorbell()?.name ?? "",
       "microphoneGranted": AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
       "pushReady": pushReady,
     ]

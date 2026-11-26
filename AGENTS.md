@@ -15,7 +15,7 @@ The Android application ID and iOS bundle ID are both `nl.niek.doorbellcompanion
 
 - From `app/`, run `flutter pub get` and `flutter analyze`. Match the Flutter version in the Android workflow when reproducing CI.
 - From `app/`, run `flutter build apk --release` for Android or `flutter build ios --simulator` on macOS for an iOS compile check. Use a signed iPhone build to verify APNs VoIP delivery and CallKit.
-- In the app, use **Test call** for camera and audio, then **Test HA push (3s delay)** with the phone locked to verify the Home Assistant push path.
+- In the app, use **View** on a doorbell for camera and audio, then **Test ring** with the phone locked to verify the Home Assistant push path.
 - From `worker/`, run `npx wrangler deploy --dry-run` to check the relay bundle locally.
 
 ## GitHub Actions
