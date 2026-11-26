@@ -75,13 +75,8 @@ class MainActivity : FlutterActivity() {
             syncExecutor.execute {
                 try {
                     HomeAssistantAuth.discoverDoorbellsAndWarmup(applicationContext)
-                    if (HomeAssistantAuth.needsDoorbellSubscriptionSync(applicationContext) &&
-                        !HomeAssistantAuth.prefs(this).getString("fcm_token", null).isNullOrBlank()
-                    ) {
-                        HomeAssistantAuth.setupPushAutomation(applicationContext, refreshTriggers = true)
-                    }
                 } catch (e: Exception) {
-                    Log.w("DoorbellCompanion", "Doorbell setup on launch failed: ${e.message}")
+                    Log.w("DoorbellCompanion", "Doorbell discovery on launch failed: ${e.message}")
                 }
                 main.post {
                     if (!isDestroyed) {

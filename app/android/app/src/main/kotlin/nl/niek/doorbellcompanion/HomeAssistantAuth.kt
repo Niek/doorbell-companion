@@ -101,9 +101,8 @@ object HomeAssistantAuth {
             } ?: error("Could not reach Home Assistant. Check the connection and try again.")
 
             val entryId = registrationEntryId(endpoint, token, p.getString("ha_webhook_id", null))
-            deleteAutomation(endpoint, token, automationId())
             if (entryId != null) {
-                deleteFromHomeAssistant(endpoint, token, "/api/config/config_entries/entry/$entryId", "phone registration")
+                deleteRegistration(endpoint, token, entryId)
             }
             // A retry after revocation must work even if the server already invalidated this session.
             check(p.edit().putString(PENDING_REVOCATION, endpoint).commit()) { "Could not save disconnect progress" }
@@ -125,7 +124,6 @@ object HomeAssistantAuth {
                 .remove("ha_refresh_token")
                 .remove("ha_token_expires_at")
                 .remove("ha_doorbells")
-                .remove("ha_doorbell_subscription_synced")
                 .remove("ha_disabled_cameras")
                 .remove("ha_default_camera")
                 .remove("ha_ice_servers")
@@ -695,9 +693,6 @@ object HomeAssistantAuth {
         return getSavedDoorbells(context).filter { it.cameraEntityId !in disabled }
     }
 
-    fun needsDoorbellSubscriptionSync(context: Context): Boolean =
-        !prefs(context).getBoolean("ha_doorbell_subscription_synced", false)
-
     /** Picks the explicit push camera if provided, else the first selected doorbell (falling back to the first camera). */
     fun resolveCameraForPush(context: Context, data: Map<String, String>): Pair<String?, String> {
         val directEntity = data["camera_entity_id"]?.takeIf { it.isNotBlank() }
@@ -723,8 +718,6 @@ object HomeAssistantAuth {
         val fcmToken = p.getString("fcm_token", null)?.takeIf { it.isNotBlank() }
             ?: error("Firebase token not ready yet")
         val pushUrl = PUSH_RELAY_URL
-        val migrating = p.contains("ha_webhook_id") && needsDoorbellSubscriptionSync(context)
-        if (migrating && !refreshTriggers) discoverDoorbellsAndWarmup(context)
         val token = getAccessToken(context) ?: error("Not authenticated with Home Assistant")
 
         val devName = deviceName()
@@ -754,17 +747,12 @@ object HomeAssistantAuth {
                 webhookId = body.optString("webhook_id").takeIf { it.isNotBlank() }
                     ?: error("Home Assistant did not return a webhook_id")
             }
+            p.edit().putString("ha_webhook_id", webhookId).remove("ha_notify_service").apply()
             Thread.sleep(500)
         }
 
         val notifyService = "notify.${deviceSlug()}"
-        p.edit()
-            .putString("ha_webhook_id", webhookId)
-            .putString("ha_push_url", pushUrl)
-            .putString("ha_notify_service", notifyService)
-            .apply()
-
-        syncSharedAutomation(context, baseUrl, token, refreshTriggers || migrating)
+        syncSharedAutomation(context, baseUrl, token, refreshTriggers)
         val routes = JSONObject()
         for (db in getEnabledDoorbells(context)) {
             for (ringEntity in db.ringEntityIds) {
@@ -790,8 +778,7 @@ object HomeAssistantAuth {
                 "Home Assistant could not save this phone's doorbell subscriptions"
             }
         }
-        deleteAutomation(baseUrl, token, automationId())
-        p.edit().putBoolean("ha_doorbell_subscription_synced", true).apply()
+        p.edit().putString("ha_push_url", pushUrl).putString("ha_notify_service", notifyService).apply()
         notifyService
     }
 
@@ -870,24 +857,18 @@ object HomeAssistantAuth {
     private fun haRequest(baseUrl: String, token: String, path: String): Request.Builder =
         Request.Builder().url("$baseUrl$path").header("Authorization", "Bearer $token")
 
-    private fun deleteAutomation(baseUrl: String, token: String, autoId: String) {
-        deleteFromHomeAssistant(baseUrl, token, "/api/config/automation/config/$autoId", "doorbell automation")
-    }
-
-    private fun deleteFromHomeAssistant(endpoint: String, token: String, path: String, item: String) {
+    private fun deleteRegistration(endpoint: String, token: String, entryId: String) {
+        val path = "/api/config/config_entries/entry/$entryId"
         try {
             cleanupCall(haRequest(endpoint, token, path).delete().build()).use { response ->
-                // The automation editor returns 400 for an automation that is already absent.
-                val alreadyRemoved = response.code == 400 && path.startsWith("/api/config/automation/") &&
-                    runCatching { JSONObject(response.body?.string().orEmpty()).optString("message") }.getOrNull() == "Resource not found"
                 when {
-                    response.isSuccessful || response.code == 404 || alreadyRemoved -> Unit
-                    response.code == 401 || response.code == 403 -> error("A Home Assistant administrator must remove the $item")
-                    else -> error("Could not remove the $item (HTTP ${response.code})")
+                    response.isSuccessful || response.code == 404 -> Unit
+                    response.code == 401 || response.code == 403 -> error("A Home Assistant administrator must remove the phone registration")
+                    else -> error("Could not remove the phone registration (HTTP ${response.code})")
                 }
             }
         } catch (_: IOException) {
-            error("Could not remove the $item. Check the connection and try again.")
+            error("Could not remove the phone registration. Check the connection and try again.")
         }
     }
 
@@ -918,5 +899,4 @@ object HomeAssistantAuth {
     private fun deviceName(): String = "Doorbell Companion ${Build.MODEL}"
     private fun registrationDeviceId(): String = "doorbell_companion_${sanitizeSlug(Build.MODEL)}"
     private fun deviceSlug(): String = "mobile_app_${sanitizeSlug(deviceName())}"
-    private fun automationId(): String = sanitizeSlug(deviceName())
 }

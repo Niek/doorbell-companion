@@ -82,8 +82,7 @@ final class HomeAssistant {
     return urls
   }
   var name: String { "Doorbell Companion iOS \(deviceID)" }
-  var automationID: String { "doorbell_companion_ios_\(deviceID)" }
-  private var notifyService: String { "mobile_app_\(automationID)" }
+  private var notifyService: String { "mobile_app_doorbell_companion_ios_\(deviceID)" }
 
   init() {
     credentials = Self.loadCredentials()
@@ -331,16 +330,12 @@ final class HomeAssistant {
   func setupPush(token pushToken: String, force: Bool = false) async throws {
     guard url != nil else { return }
     let syncKey = "synced_doorbell_subscription"
-    let migrating = defaults.data(forKey: "synced_automation") != nil && defaults.data(forKey: syncKey) == nil
-    if migrating, !force {
-      try await refreshDoorbells()
-    }
     let enabled = doorbells.filter { $0.enabled && !$0.triggers.isEmpty }
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
-    let automationState = try encoder.encode(enabled)
+    let subscriptionState = try encoder.encode(enabled)
     if !force, deviceRegistration != nil, registeredPushToken == pushToken,
-       defaults.data(forKey: syncKey) == automationState {
+       defaults.data(forKey: syncKey) == subscriptionState {
       return
     }
     let token = try await accessToken()
@@ -380,7 +375,7 @@ final class HomeAssistant {
     registeredPushToken = pushToken
     defaults.set(pushToken, forKey: "registered_push_token")
 
-    try await syncSharedAutomation(at: endpoint, token: token, refreshTriggers: force || migrating)
+    try await syncSharedAutomation(at: endpoint, token: token, refreshTriggers: force)
     guard let registration = deviceRegistration else { throw DoorbellCompanionError("Missing phone registration") }
     var routes: [String: [String: String]] = [:]
     for bell in enabled {
@@ -399,10 +394,7 @@ final class HomeAssistant {
     guard (try JSONSerialization.jsonObject(with: result) as? JSON)?["success"] as? Bool == true else {
       throw DoorbellCompanionError("Home Assistant could not save this phone's doorbell subscriptions")
     }
-    _ = try await request(at: endpoint, path: "api/config/automation/config/\(automationID)",
-                          token: token, method: "DELETE", allowMissing: true)
-    defaults.set(automationState, forKey: syncKey)
-    defaults.removeObject(forKey: "synced_automation")
+    defaults.set(subscriptionState, forKey: syncKey)
   }
 
   static func sharedAutomationTemplate() throws -> JSON {
@@ -464,11 +456,8 @@ final class HomeAssistant {
       let token = try await accessToken(forceRefresh: true)
       endpoint = try await reachableEndpoint(token: token)
       let entryID = try await registrationEntryID(at: endpoint, token: token)
-      try await deleteAtDisconnect(at: endpoint, token: token,
-        path: "api/config/automation/config/\(automationID)", item: "doorbell automation")
       if let entryID {
-        try await deleteAtDisconnect(at: endpoint, token: token,
-          path: "api/config/config_entries/entry/\(entryID)", item: "phone registration")
+        try await deleteRegistration(at: endpoint, token: token, entryID: entryID)
       }
       // The server may already have revoked the token when a retry runs.
       var pending = self.credentials ?? credentials
@@ -492,7 +481,7 @@ final class HomeAssistant {
     deviceRegistration = nil
     registeredPushToken = nil
     registrationServer = nil
-    for key in ["doorbells", "local_url", "external_url", "synced_automation", "synced_doorbell_subscription", "registration",
+    for key in ["doorbells", "local_url", "external_url", "synced_doorbell_subscription", "registration",
                 "registered_push_token", "registration_server"] {
       defaults.removeObject(forKey: key)
     }
@@ -534,13 +523,14 @@ final class HomeAssistant {
     return entryID
   }
 
-  private func deleteAtDisconnect(at endpoint: URL, token: String, path: String, item: String) async throws {
+  private func deleteRegistration(at endpoint: URL, token: String, entryID: String) async throws {
     do {
-      _ = try await request(at: endpoint, path: path, token: token, method: "DELETE", allowMissing: true)
+      _ = try await request(at: endpoint, path: "api/config/config_entries/entry/\(entryID)",
+                            token: token, method: "DELETE", allowMissing: true)
     } catch let error as HAHTTPError where error.status == 401 || error.status == 403 {
-      throw DoorbellCompanionError("A Home Assistant administrator must remove the \(item)")
+      throw DoorbellCompanionError("A Home Assistant administrator must remove the phone registration")
     } catch {
-      throw DoorbellCompanionError("Could not remove the \(item). \(error.localizedDescription)")
+      throw DoorbellCompanionError("Could not remove the phone registration. \(error.localizedDescription)")
     }
   }
 

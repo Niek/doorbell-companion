@@ -54,8 +54,6 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 3. Allow notifications, and on Android full-screen calls. Allow the microphone for talkback.
 4. Under a doorbell, tap **View** to check the camera, then **Test ring** and lock your phone within 3 seconds.
 
-Moving from a build with an older app ID? Disconnect that one first to avoid double rings.
-
 Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the phone’s doorbell subscriptions and Mobile App registration and revokes its Home Assistant session. The shared automation serves the remaining phones.
 
 ## Self-hosting the relay

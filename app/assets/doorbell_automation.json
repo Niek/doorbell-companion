@@ -39,17 +39,11 @@
       ],
       "default": [
         {
-          "variables": {
-            "subscriptions": "{{ integration_entities('mobile_app') | select('match', '^sensor[.]') | map('state_attr', 'doorbell_companion_subscription') | select('mapping') | list }}",
-            "legacy_automations": "{{ states.automation | selectattr('state', 'eq', 'on') | map(attribute='attributes.id') | select('defined') | list }}"
-          }
-        },
-        {
           "repeat": {
-            "for_each": "{{ subscriptions }}",
+            "for_each": "{{ integration_entities('mobile_app') | select('match', '^sensor[.]') | map('state_attr', 'doorbell_companion_subscription') | select('mapping') | list }}",
             "sequence": [
               {
-                "if": "{{ trigger.id | default('') in repeat.item.doorbells and repeat.item.service | replace('notify.mobile_app_', '', 1) not in legacy_automations }}",
+                "if": "{{ trigger.id | default('') in repeat.item.doorbells }}",
                 "then": [
                   {
                     "event": "doorbell_companion_send_call",
