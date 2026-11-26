@@ -1,0 +1,29 @@
+api:
+  listen: 127.0.0.1:1984
+  static_dir: /media
+  allow_paths:
+    - /
+    - /api
+    - /api/frame.jpeg
+    - /api/preload
+    - /api/schemes
+    - /api/streams
+    - /api/webrtc
+    - /api/ws
+
+rtsp:
+  listen: 127.0.0.1:8554
+
+webrtc:
+  listen: ""
+  ice_servers:
+    - urls: [stun:stun.l.google.com:19302]
+
+exec:
+  allow_paths: [ffmpeg]
+
+ffmpeg:
+  loop: -re -stream_loop -1 -i {input}
+
+streams:
+  review_doorbell: ffmpeg:/media/review_doorbell.mp4#input=loop#video=copy

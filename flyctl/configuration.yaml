@@ -1,0 +1,13 @@
+default_config:
+
+homeassistant:
+  name: Doorbell Companion Review
+  external_url: https://doorbell-companion-review.fly.dev
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 172.16.0.0/16 # Fly Proxy connects to the machine from this private range.
+    - 66.241.125.76 # Fly appends this app's shared IPv4 to X-Forwarded-For.
+
+automation: !include automations.yaml

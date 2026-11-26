@@ -1,0 +1,21 @@
+app = "doorbell-companion-review"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8123
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[mounts]]
+  source = "ha_data"
+  destination = "/config"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
