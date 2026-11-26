@@ -122,7 +122,6 @@ class CallActivity : Activity() {
         }
         remoteVideo.setScalingType(videoScale)
         snapshotView.scaleType = imageScale
-        remoteVideo.requestLayout()
     }
 
     private fun dismissCall() {
@@ -179,13 +178,20 @@ class CallActivity : Activity() {
             visibility = View.GONE
         }
 
-        fun fullCenteredParams() = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            Gravity.CENTER,
+        // WebRTC needs flexible bounds in both dimensions to honor aspect fit.
+        root.addView(
+            remoteVideo,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ),
         )
-        root.addView(remoteVideo, fullCenteredParams())
-        root.addView(snapshotView, fullCenteredParams())
+        root.addView(
+            snapshotView,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        )
         root.setOnClickListener {
             fillScreen = !fillScreen
             applyScalingMode()
