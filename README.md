@@ -48,7 +48,7 @@ Based on Home Assistant Core [2026.11.3](https://github.com/home-assistant/core/
 ## Requirements
 
 - **Phone:** Android 8.1+ with Google Play Services, or iOS 15+.
-- **Home Assistant:** A supported doorbell with a WebRTC-compatible camera stream.
+- **Home Assistant:** A WebRTC-compatible camera stream and a doorbell press that Home Assistant can detect.
 - **Away from home:** An external Home Assistant URL configured for remote calls.
 
 <details>
@@ -61,6 +61,13 @@ Doorbell press detection needs a `camera.*` entity and a press `binary_sensor.*`
 - be a Reolink **Visitor** sensor.
 
 </details>
+
+### Camera and a separate button?
+
+1. In Home Assistant, create a [Template Binary Sensor](https://www.home-assistant.io/integrations/template/#binary-sensor) helper. Set **Device** to the camera's Home Assistant device and **State** to `{{ is_state('binary_sensor.your_button', 'on') }}`.
+2. Set the helper's entity ID to end in `_doorbell` (for example, `binary_sensor.front_door_doorbell`), then refresh Doorbell Companion in **Settings**.
+
+If the button only fires an event, use an automation to briefly turn a [Toggle helper](https://www.home-assistant.io/integrations/input_boolean/) on and back off, and use that toggle in the template.
 
 ## Setup
 
