@@ -42,6 +42,27 @@ final class RunnerTests: XCTestCase {
   }
 
   @MainActor
+  func testDingAndChimeUseDoorbellClassFromState() {
+    for event in ["ding", "chime"] {
+      let ring = "event.front_\(event)"
+      let entities: [JSON] = [
+        ["device_id": "door", "entity_id": "camera.front"],
+        ["device_id": "door", "entity_id": ring, "translation_key": event],
+        ["device_id": "door", "entity_id": "event.front_motion", "translation_key": "motion"],
+      ]
+      let states: [JSON] = [
+        ["entity_id": ring, "attributes": ["device_class": "doorbell", "event_types": ["ring"]]],
+        ["entity_id": "event.front_motion", "attributes": ["device_class": "motion", "event_types": ["motion"]]],
+      ]
+      let bells = HomeAssistant.discoverDoorbells(devices: [], entities: entities, states: states,
+                                                  version: "2026.11.3")
+      XCTAssertEqual(bells.first?.camera, "camera.front")
+      XCTAssertEqual(bells.first?.triggers, [ring])
+      XCTAssertEqual(bells.first?.automationTrigger(for: ring, id: ring)["trigger"] as? String, "event.received")
+    }
+  }
+
+  @MainActor
   func testEventDoorbellWithNoBinaryTrigger() {
     let entities: [JSON] = [
       ["device_id": "door", "entity_id": "camera.front"],

@@ -407,11 +407,15 @@ final class HomeAssistant {
       names[id] = device["name_by_user"] as? String ?? device["name"] as? String
     }
     var friendlyNames: [String: String] = [:]
+    var doorbellStates = Set<String>()
     var ringEvents = Set<String>()
     for state in states {
       guard let id = state["entity_id"] as? String else { continue }
       let attributes = state["attributes"] as? JSON
       friendlyNames[id] = attributes?["friendly_name"] as? String
+      if attributes?["device_class"] as? String == "doorbell" {
+        doorbellStates.insert(id)
+      }
       if (attributes?["event_types"] as? [String])?.contains("ring") == true {
         ringEvents.insert(id)
       }
@@ -432,7 +436,7 @@ final class HomeAssistant {
         else { standalone.append(entity) }
       } else if let device, id.hasPrefix("binary_sensor.") || id.hasPrefix("event.") {
         let classes = ["translation_key", "original_device_class", "device_class"]
-        if classes.contains(where: { entity[$0] as? String == "doorbell" })
+        if doorbellStates.contains(id) || classes.contains(where: { entity[$0] as? String == "doorbell" })
             || id.hasSuffix("_doorbell") {
           rings[device, default: []].append(id)
           if id.hasPrefix("event."), entity["platform"] as? String == "unifiprotect" {
