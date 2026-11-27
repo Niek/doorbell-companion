@@ -436,7 +436,11 @@ final class HomeAssistant {
         else { standalone.append(entity) }
       } else if let device, id.hasPrefix("binary_sensor.") || id.hasPrefix("event.") {
         let classes = ["translation_key", "original_device_class", "device_class"]
-        if doorbellStates.contains(id) || classes.contains(where: { entity[$0] as? String == "doorbell" })
+        // Reolink only creates its Visitor sensor for doorbell channels, and it has no device class.
+        let reolinkVisitor = id.hasPrefix("binary_sensor.") && entity["platform"] as? String == "reolink"
+          && entity["translation_key"] as? String == "visitor"
+        if doorbellStates.contains(id) || reolinkVisitor
+            || classes.contains(where: { entity[$0] as? String == "doorbell" })
             || id.hasSuffix("_doorbell") {
           rings[device, default: []].append(id)
           if id.hasPrefix("event."), entity["platform"] as? String == "unifiprotect" {

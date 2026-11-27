@@ -683,6 +683,9 @@ object HomeAssistantAuth {
             val deviceId = e.optString("device_id")
             val translationKey = e.optString("translation_key")
             val origClass = e.optString("original_device_class")
+            // Reolink only creates its Visitor sensor for doorbell channels, and it has no device class.
+            val reolinkVisitor = entityId.startsWith("binary_sensor.") &&
+                e.optString("platform") == "reolink" && translationKey == "visitor"
 
             if (entityId.startsWith("camera.")) {
                 if (deviceId.isNotBlank() && deviceId != "null") {
@@ -691,7 +694,7 @@ object HomeAssistantAuth {
                     standaloneCameras.add(e)
                 }
             } else if ((entityId.startsWith("binary_sensor.") || entityId.startsWith("event.")) &&
-                (entityId in doorbellStates || translationKey == "doorbell" || origClass == "doorbell" ||
+                (entityId in doorbellStates || reolinkVisitor || translationKey == "doorbell" || origClass == "doorbell" ||
                     e.optString("device_class") == "doorbell" || entityId.endsWith("_doorbell"))
             ) {
                 if (deviceId.isNotBlank() && deviceId != "null") {

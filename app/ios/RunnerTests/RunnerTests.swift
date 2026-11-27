@@ -63,6 +63,25 @@ final class RunnerTests: XCTestCase {
   }
 
   @MainActor
+  func testReolinkVisitorRingsWithDefaultEntityID() {
+    let visitor = "binary_sensor.front_visitor"
+    let entities: [JSON] = [
+      ["device_id": "door", "entity_id": "camera.front_fluent", "platform": "reolink"],
+      ["device_id": "door", "entity_id": visitor, "platform": "reolink", "translation_key": "visitor"],
+      ["device_id": "door", "entity_id": "binary_sensor.front_person", "platform": "reolink",
+       "translation_key": "person"],
+      ["device_id": "other", "entity_id": "camera.other"],
+      ["device_id": "other", "entity_id": "binary_sensor.other_visitor", "platform": "template",
+       "translation_key": "visitor"],
+    ]
+    let bells = HomeAssistant.discoverDoorbells(devices: [], entities: entities, states: [], version: "2026.11.3")
+    XCTAssertEqual(bells.count, 1)
+    XCTAssertEqual(bells.first?.camera, "camera.front_fluent")
+    XCTAssertEqual(bells.first?.triggers, [visitor])
+    XCTAssertEqual(bells.first?.automationTrigger(for: visitor, id: "front")["to"] as? String, "on")
+  }
+
+  @MainActor
   func testEventDoorbellWithNoBinaryTrigger() {
     let entities: [JSON] = [
       ["device_id": "door", "entity_id": "camera.front"],
