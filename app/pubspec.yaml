@@ -1,7 +1,7 @@
 name: doorbell_companion
 description: "Doorbell calls for Home Assistant on Android and iOS."
 publish_to: 'none'
-version: 1.0.8+11
+version: 1.0.9+12
 
 environment:
   sdk: ^3.13.0
