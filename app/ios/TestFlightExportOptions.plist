@@ -13,6 +13,6 @@
 	<key>teamID</key>
 	<string>N577R5DT64</string>
 	<key>testFlightInternalTestingOnly</key>
-	<true/>
+	<false/>
 </dict>
 </plist>
