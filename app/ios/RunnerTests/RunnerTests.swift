@@ -62,6 +62,18 @@ final class RunnerTests: XCTestCase {
     }
   }
 
+  func testSavedDoorbellsWithoutDataChannelStillDecode() throws {
+    let saved = Data(#"[{"camera":"camera.front","name":"Front","triggers":[],"talkback":false,"enabled":true}]"#.utf8)
+    let bells = try JSONDecoder().decode([Doorbell].self, from: saved)
+    XCTAssertEqual(bells.first?.camera, "camera.front")
+    XCTAssertNil(bells.first?.dataChannel)
+
+    var nest = bells[0]
+    nest.dataChannel = "dataSendChannel"
+    let roundTrip = try JSONDecoder().decode(Doorbell.self, from: JSONEncoder().encode(nest))
+    XCTAssertEqual(roundTrip.dataChannel, "dataSendChannel")
+  }
+
   @MainActor
   func testReolinkVisitorRingsWithDefaultEntityID() {
     let visitor = "binary_sensor.front_visitor"

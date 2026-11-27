@@ -149,6 +149,7 @@ object HomeAssistantAuth {
                 .remove("ha_webhook_id")
                 .remove("ha_push_url")
                 .remove("ha_two_way_cameras")
+                .remove("ha_data_channels")
                 .remove("ha_registered_push_token")
                 .remove("ha_legacy_device")
                 .remove(SYNCED_SUBSCRIPTION)
@@ -536,6 +537,14 @@ object HomeAssistantAuth {
             }
         }
         editor.putStringSet("ha_two_way_cameras", twoWayCameras)
+        val dataChannels = JSONObject()
+        doorbells.forEachIndexed { idx, db ->
+            // Keep the previous label if this camera's config did not arrive before the warmup finished.
+            val label = msgMap[2000 + idx]?.let { it.optJSONObject("result")?.optString("dataChannel") }
+                ?: dataChannel(context, db.cameraEntityId)
+            label?.takeIf { it.isNotBlank() }?.let { dataChannels.put(db.cameraEntityId, it) }
+        }
+        editor.putString("ha_data_channels", dataChannels.toString())
         editor.apply()
         return doorbells
     }
@@ -609,6 +618,13 @@ object HomeAssistantAuth {
                                     expectedPhase2Ids.add(capId)
                                     webSocket.send(
                                         JSONObject().put("id", capId).put("type", "camera/capabilities")
+                                            .put("entity_id", db.cameraEntityId).toString()
+                                    )
+                                    // Some cameras, such as Nest WebRTC models, need a data channel in the offer.
+                                    val configId = 2000 + idx
+                                    expectedPhase2Ids.add(configId)
+                                    webSocket.send(
+                                        JSONObject().put("id", configId).put("type", "camera/webrtc/get_client_config")
                                             .put("entity_id", db.cameraEntityId).toString()
                                     )
                                 }
@@ -761,6 +777,25 @@ object HomeAssistantAuth {
 
     fun supportsTwoWayAudio(context: Context, cameraEntityId: String): Boolean =
         cameraEntityId in (prefs(context).getStringSet("ha_two_way_cameras", emptySet()) ?: emptySet())
+
+    /** Data channel label Home Assistant asks for in this camera's WebRTC offer (Nest WebRTC cameras need one). */
+    fun dataChannel(context: Context, cameraEntityId: String): String? = try {
+        JSONObject(prefs(context).getString("ha_data_channels", null) ?: "{}")
+            .optString(cameraEntityId).takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
+    }
+
+    fun saveDataChannel(context: Context, cameraEntityId: String, label: String?) {
+        val p = prefs(context)
+        val channels = try {
+            JSONObject(p.getString("ha_data_channels", null) ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        if (label.isNullOrBlank()) channels.remove(cameraEntityId) else channels.put(cameraEntityId, label)
+        p.edit().putString("ha_data_channels", channels.toString()).apply()
+    }
 
     fun hasAnyTwoWayAudio(context: Context): Boolean =
         !(prefs(context).getStringSet("ha_two_way_cameras", emptySet()).isNullOrEmpty())

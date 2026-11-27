@@ -25,6 +25,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   private var remoteCandidates: [RTCIceCandidate] = []
   private var remoteDescriptionSet = false
   private var audioSender: RTCRtpSender?
+  private var dataChannel: RTCDataChannel?
   private var microphone: RTCAudioTrack?
   private var acceptsAudio = false
   private var answered = false
@@ -76,7 +77,8 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     }
   }
 
-  private func buildPeerAndOffer(iceServers serverData: [JSON]) async throws -> (RTCPeerConnection, String) {
+  private func buildPeerAndOffer(iceServers serverData: [JSON],
+                                 dataChannel dataChannelLabel: String?) async throws -> (RTCPeerConnection, String) {
     let configuration = RTCConfiguration()
     configuration.sdpSemantics = .unifiedPlan
     configuration.bundlePolicy = .maxBundle
@@ -102,10 +104,18 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     self.connection = connection
     let video = RTCRtpTransceiverInit()
     video.direction = .recvOnly
-    connection.addTransceiver(of: .video, init: video)
     let audio = RTCRtpTransceiverInit()
     audio.direction = bell.talkback ? .sendRecv : .recvOnly
-    audioSender = connection.addTransceiver(of: .audio, init: audio)?.sender
+    if let dataChannelLabel {
+      // Nest WebRTC cameras need audio, video and data channel sections, in that order.
+      // libwebrtc always puts the data channel section last in the first offer.
+      audioSender = connection.addTransceiver(of: .audio, init: audio)?.sender
+      connection.addTransceiver(of: .video, init: video)
+      dataChannel = connection.dataChannel(forLabel: dataChannelLabel, configuration: RTCDataChannelConfiguration())
+    } else {
+      connection.addTransceiver(of: .video, init: video)
+      audioSender = connection.addTransceiver(of: .audio, init: audio)?.sender
+    }
 
     let offer = try await connection.offer(for: constraints)
     try Task.checkCancellation()
@@ -146,7 +156,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     // Overlap PeerConnection + offer creation with WebSocket connect when ICE servers are cached.
     let cachedIce = home.cachedICEServers()
     let prebuiltOffer: Task<(RTCPeerConnection, String), Error>? = cachedIce.map { servers in
-      Task { try await self.buildPeerAndOffer(iceServers: servers) }
+      Task { try await self.buildPeerAndOffer(iceServers: servers, dataChannel: self.bell.dataChannel) }
     }
     defer { prebuiltOffer?.cancel() }
 
@@ -170,7 +180,9 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       ]) as? JSON
       let serverData = (config?["configuration"] as? JSON)?["iceServers"] as? [JSON] ?? []
       home.saveICEServers(serverData)
-      (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData)
+      let dataChannelLabel = config?["dataChannel"] as? String
+      home.saveDataChannel(dataChannelLabel, camera: bell.camera)
+      (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData, dataChannel: dataChannelLabel)
     }
 
     let latestSdp = connection.localDescription?.sdp.isEmpty == false ? connection.localDescription!.sdp : offerSdp
@@ -186,9 +198,12 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       let message = try await socket.receive()
       let msgID = message["id"] as? Int
       if let configCommandID, msgID == configCommandID, message["type"] as? String == "result" {
-        if let result = message["result"] as? JSON,
-           let servers = (result["configuration"] as? JSON)?["iceServers"] as? [JSON] {
-          home.saveICEServers(servers)
+        if let result = message["result"] as? JSON {
+          if let servers = (result["configuration"] as? JSON)?["iceServers"] as? [JSON] {
+            home.saveICEServers(servers)
+          }
+          // The offer is already in flight, so a changed data channel applies from the next call.
+          home.saveDataChannel(result["dataChannel"] as? String, camera: bell.camera)
         }
         continue
       }
@@ -284,6 +299,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     snapshotTask?.cancel()
     snapshot = nil
     socket?.close()
+    dataChannel?.close()
     connection?.close()
     microphone?.isEnabled = false
     connection = nil

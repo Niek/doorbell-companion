@@ -25,6 +25,8 @@ struct Doorbell: Codable {
   var nativeRingEvents: [String]?
   var talkback = false
   var enabled = true
+  /// Data channel label Home Assistant asks for in the WebRTC offer (Nest WebRTC cameras need one).
+  var dataChannel: String?
 
   var flutterValue: JSON { ["cameraEntityId": camera, "name": name, "enabled": enabled] }
 
@@ -135,6 +137,16 @@ final class HomeAssistant {
       if Date().timeIntervalSince1970 - savedAt >= 6 * 60 * 60 { return nil }
     }
     return servers
+  }
+
+  /// Remembers a camera's data channel from a call's client config so the next prebuilt offer includes it.
+  func saveDataChannel(_ label: String?, camera: String) {
+    var changed = false
+    for index in doorbells.indices where doorbells[index].camera == camera && doorbells[index].dataChannel != label {
+      doorbells[index].dataChannel = label
+      changed = true
+    }
+    if changed { saveDoorbells() }
   }
 
   func saveICEServers(_ servers: [JSON]) {
@@ -372,6 +384,14 @@ final class HomeAssistant {
           required: false
         ))
       }
+      let configStartIndex = phase2Requests.count
+      for bell in discovered {
+        phase2Requests.append((
+          type: "camera/webrtc/get_client_config",
+          fields: ["entity_id": bell.camera],
+          required: false
+        ))
+      }
 
       let phase2 = try await socket.pipeline(phase2Requests)
       if let iceConfig = phase2[iceIndex] as? JSON,
@@ -381,6 +401,8 @@ final class HomeAssistant {
       for index in discovered.indices {
         let cap = phase2[capStartIndex + index] as? JSON
         discovered[index].talkback = cap?["two_way_audio"] as? Bool == true
+        let clientConfig = phase2[configStartIndex + index] as? JSON
+        discovered[index].dataChannel = clientConfig?["dataChannel"] as? String
         discovered[index].enabled = !disabled.contains(discovered[index].camera)
       }
     }

@@ -181,6 +181,7 @@ class HomeAssistantRemote(
 
     private var peer: PeerConnection? = null
     private var audioTransceiver: RtpTransceiver? = null
+    private var dataChannel: DataChannel? = null
     private var remoteAudio: AudioTrack? = null
     private var localAudio: AudioTrack? = null
     private var audioSource: AudioSource? = null
@@ -469,6 +470,10 @@ class HomeAssistantRemote(
                 "result" -> {
                     val id = msg.optInt("id")
                     if (id == configMsgId) {
+                        msg.optJSONObject("result")?.let { result ->
+                            // Applies to this call if the peer is not built yet, otherwise to the next call.
+                            HomeAssistantAuth.saveDataChannel(context, cameraEntityId, result.optString("dataChannel"))
+                        }
                         val iceArr = msg.optJSONObject("result")
                             ?.optJSONObject("configuration")
                             ?.optJSONArray("iceServers")
@@ -614,19 +619,34 @@ class HomeAssistantRemote(
             }) ?: error("Could not create PeerConnection")
 
             peer = connection
-            connection.addTransceiver(
-                MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
-            )
             val audioDirection = if (HomeAssistantAuth.supportsTwoWayAudio(context, cameraEntityId)) {
                 RtpTransceiver.RtpTransceiverDirection.SEND_RECV
             } else {
                 RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
             }
-            audioTransceiver = connection.addTransceiver(
-                MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-                RtpTransceiver.RtpTransceiverInit(audioDirection)
-            )
+            val addVideo = {
+                connection.addTransceiver(
+                    MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
+                    RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+                )
+            }
+            val addAudio = {
+                audioTransceiver = connection.addTransceiver(
+                    MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+                    RtpTransceiver.RtpTransceiverInit(audioDirection)
+                )
+            }
+            val dataChannelLabel = HomeAssistantAuth.dataChannel(context, cameraEntityId)
+            if (dataChannelLabel != null) {
+                // Nest WebRTC cameras need audio, video and data channel sections, in that order.
+                // libwebrtc always puts the data channel section last in the first offer.
+                addAudio()
+                addVideo()
+                dataChannel = connection.createDataChannel(dataChannelLabel, DataChannel.Init())
+            } else {
+                addVideo()
+                addAudio()
+            }
 
             timing?.mark("ha_create_offer")
             connection.createOffer(object : SimpleSdpObserver() {
@@ -872,6 +892,7 @@ class HomeAssistantRemote(
                     racingSockets.forEach { if (it !== ws) it.cancel() }
                     racingSockets.clear()
                     authRequiredSockets.clear()
+                    dataChannel?.dispose()
                     peer?.dispose()
                     audioSource?.dispose()
                 } catch (e: Exception) {
