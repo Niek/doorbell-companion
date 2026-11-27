@@ -2,10 +2,12 @@ import AVFoundation
 import CallKit
 import PushKit
 import UIKit
+import UserNotifications
 import WebRTC
 
 @MainActor
-final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @preconcurrency CXProviderDelegate {
+final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @preconcurrency CXProviderDelegate,
+                           UNUserNotificationCenterDelegate {
   private struct Incoming {
     let id: UUID
     let media: CameraCall
@@ -38,6 +40,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     configuration.iconTemplateImageData = UIImage(named: "CallKitIcon")?.pngData()
     provider = CXProvider(configuration: configuration)
     super.init()
+    UNUserNotificationCenter.current().delegate = self
     provider.setDelegate(self, queue: .main)
     let rtcAudio = RTCAudioSession.sharedInstance()
     rtcAudio.useManualAudio = true
@@ -99,6 +102,9 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     let available = active == nil && bell != nil && home.url != nil
     if available, let bell {
       let media = makeMedia(bell, workerTimeMs: workerTimeMs, eventTimeMs: eventTimeMs)
+      media.snapshotReady = { [weak self] data in
+        self?.postSnapshot(data, callID: id, doorbellName: bell.name)
+      }
       active = Incoming(id: id, media: media, usesCallKit: true)
     }
     provider.reportNewIncomingCall(with: id, update: update) { [weak self] error in
@@ -184,6 +190,8 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     guard active?.id == action.callUUID else { action.fail(); return }
     timeout?.cancel()
     active?.answered = true
+    // The live camera replaces the snapshot, so drop the ring notification.
+    UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [action.callUUID.uuidString])
     configureAudioSession()
     active?.media.answer()
     action.fulfill()
@@ -267,6 +275,48 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     setAudioActive(false)
     if !active.usesCallKit {
       try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+  }
+
+  /// CallKit can't show images, so a ringing call also posts the doorbell snapshot as a notification.
+  /// It stays in Notification Center unless the call is answered, so a missed ring still shows who was there.
+  private func postSnapshot(_ data: Data, callID: UUID, doorbellName: String) {
+    func ringing() -> Bool { active?.id == callID && active?.answered == false }
+    guard ringing() else { return }
+    let center = UNUserNotificationCenter.current()
+    // Declining ends the call's background task, so keep the app awake until the request is handed off.
+    let background = UIApplication.shared.beginBackgroundTask(withName: "Post doorbell snapshot")
+    Task {
+      defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
+      let status = await center.notificationSettings().authorizationStatus
+      guard [.authorized, .provisional, .ephemeral].contains(status), ringing() else { return }
+      let isPNG = data.starts(with: [0x89, 0x50, 0x4E, 0x47])
+      let file = FileManager.default.temporaryDirectory
+        .appendingPathComponent(callID.uuidString).appendingPathExtension(isPNG ? "png" : "jpg")
+      do {
+        try data.write(to: file)
+        let content = UNMutableNotificationContent()
+        content.title = doorbellName
+        content.body = "Someone is at the door"
+        content.threadIdentifier = "doorbell"
+        content.attachments = [try UNNotificationAttachment(identifier: "snapshot", url: file)]
+        try await center.add(UNNotificationRequest(identifier: callID.uuidString, content: content, trigger: nil))
+      } catch {
+        NSLog("Doorbell Companion snapshot notification: %@", error.localizedDescription)
+      }
+      // A delivered attachment has already been moved out of tmp, so this only cleans up failures.
+      try? FileManager.default.removeItem(at: file)
+    }
+  }
+
+  // UserNotifications calls this off the main queue.
+  nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                          withCompletionHandler completionHandler:
+                                            @escaping (UNNotificationPresentationOptions) -> Void) {
+    let id = notification.request.identifier
+    Task { @MainActor [weak self] in
+      let answered = self?.active.map { $0.answered && $0.id.uuidString == id } ?? false
+      completionHandler(answered ? [] : [.banner, .list])
     }
   }
 

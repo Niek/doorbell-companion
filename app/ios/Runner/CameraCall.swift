@@ -45,6 +45,8 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   private(set) var canMute = false
   private(set) var canRetry = false
   var didChange: (() -> Void)?
+  /// Called once with the bytes of the first snapshot that loads and decodes.
+  var snapshotReady: ((Data) -> Void)?
 
   static func warmUp() {
     DispatchQueue.global(qos: .utility).async {
@@ -223,7 +225,11 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         }
         return nil
       }
-      guard !Task.isCancelled, !firstFrameLogged, let data, let image = UIImage(data: data) else { return }
+      guard !Task.isCancelled, let data, let image = UIImage(data: data) else { return }
+      let ready = snapshotReady
+      snapshotReady = nil
+      ready?(data)
+      guard !firstFrameLogged else { return }
       snapshot = image
       mark("snapshot_ready")
       didChange?()
@@ -410,6 +416,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     snapshot = nil
     canRetry = false
     didChange = nil
+    snapshotReady = nil
   }
 
   private func resetConnection() {

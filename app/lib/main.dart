@@ -51,6 +51,7 @@ class AppStatus {
     this.fullScreenGranted = true,
     this.pushReady = false,
     this.pushError,
+    this.snapshotNotifications,
   });
 
   final bool haConnected;
@@ -61,6 +62,10 @@ class AppStatus {
   final bool fullScreenGranted;
   final bool pushReady;
   final String? pushError;
+
+  /// iOS only: whether ring snapshots may be shown as notifications
+  /// (`granted`, `undecided` or `denied`). CallKit rings without them.
+  final String? snapshotNotifications;
 
   int get enabledCount => doorbells.where((d) => d.enabled).length;
 
@@ -78,6 +83,7 @@ class AppStatus {
       fullScreenGranted: map['fullScreenGranted'] != false,
       pushReady: map['pushReady'] == true,
       pushError: map['pushError'] as String?,
+      snapshotNotifications: map['snapshotNotifications'] as String?,
     );
   }
 }
@@ -701,6 +707,15 @@ class _ConnectedBody extends StatelessWidget {
               onTap: () => controller.requestPermission('notifications'),
             ),
           ],
+          if (st.snapshotNotifications == 'undecided') ...[
+            const SizedBox(height: 12),
+            _Banner(
+              icon: Icons.photo_camera_outlined,
+              title: 'See who is at the door',
+              message: 'Allow notifications to get a camera snapshot when the doorbell rings.',
+              onTap: () => controller.requestPermission('notifications'),
+            ),
+          ],
           if (!st.fullScreenGranted) ...[
             const SizedBox(height: 12),
             _Banner(
@@ -975,6 +990,13 @@ class SettingsScreen extends StatelessWidget {
                       onTap: () => controller.requestPermission('fullScreen'),
                     ),
                   ],
+                  if (st.snapshotNotifications != null)
+                    _PermissionTile(
+                      icon: Icons.photo_camera_outlined,
+                      title: 'Snapshot notifications',
+                      granted: st.snapshotNotifications == 'granted',
+                      onTap: () => controller.requestPermission('notifications'),
+                    ),
                   _PermissionTile(
                     icon: Icons.mic_none_outlined,
                     title: 'Microphone for talkback',

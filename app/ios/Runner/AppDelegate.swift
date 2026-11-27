@@ -4,6 +4,7 @@ import CryptoKit
 import Darwin
 import Flutter
 import UIKit
+import UserNotifications
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate,
@@ -21,6 +22,8 @@ import UIKit
   private var pushSetupError: String?
   private var pushReady = false
   private var didRefreshOnLaunch = false
+  /// Notifications only carry ring snapshots on iOS. CallKit rings without them.
+  private var notificationStatus: UNAuthorizationStatus?
 
   override func application(
     _ application: UIApplication,
@@ -51,6 +54,7 @@ import UIKit
   func sceneBecameActive() {
     calls.showCameraIfReady()
     publishStatus()
+    refreshNotificationStatus()
     if !didRefreshOnLaunch, home.url != nil, !home.pendingDisconnect {
       didRefreshOnLaunch = true
       Task { [weak self] in
@@ -151,6 +155,7 @@ import UIKit
       if arguments["type"] as? String == "microphone" {
         requestMicrophone()
       } else {
+        if arguments["type"] as? String == "notifications" { requestNotifications() }
         calls.registerForVoIP()
         syncPush()
       }
@@ -192,6 +197,13 @@ import UIKit
       "pushReady": pushReady,
     ]
     if let pushSetupError { value["pushError"] = pushSetupError }
+    if let notificationStatus {
+      value["snapshotNotifications"] = switch notificationStatus {
+      case .notDetermined: "undecided"
+      case .denied: "denied"
+      default: "granted"
+      }
+    }
     return value
   }
 
@@ -294,6 +306,25 @@ import UIKit
 
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
     calls.currentWindow ?? window ?? ASPresentationAnchor()
+  }
+
+  private func refreshNotificationStatus() {
+    Task { [weak self] in
+      let settings = await UNUserNotificationCenter.current().notificationSettings()
+      guard let self, self.notificationStatus != settings.authorizationStatus else { return }
+      self.notificationStatus = settings.authorizationStatus
+      self.publishStatus()
+    }
+  }
+
+  private func requestNotifications() {
+    if notificationStatus == .denied, let url = URL(string: UIApplication.openSettingsURLString) {
+      UIApplication.shared.open(url)
+      return
+    }
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { [weak self] _, _ in
+      Task { @MainActor in self?.refreshNotificationStatus() }
+    }
   }
 
   private func requestMicrophone() {
