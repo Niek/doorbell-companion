@@ -66,26 +66,37 @@ Install `gplay` with `brew install PollyGlot/tap/gplay`. The `doorbell-play-publ
 
 ### Publish an iOS internal TestFlight build
 
-Sign in to the **Nivadema B.V.** team (`N577R5DT64`) in **Xcode → Settings → Accounts**. Xcode uses that account for automatic signing and upload. Doorbell Companion's explicit App ID has Push Notifications enabled.
+Use the **Doorbell Companion TestFlight** App Store Connect API key for **Nivadema B.V.** (`N577R5DT64`). The local `~/.config/doorbell-companion/testflight/config` sets `ASC_KEY_ID` and `ASC_ISSUER_ID`. Keep `AuthKey_<key ID>.p8` in that same directory with owner-only permissions. Xcode uses the key for provisioning and upload without an interactive Xcode sign-in. Doorbell Companion's explicit App ID has Push Notifications enabled.
 
 1. From `app/`, prepare the Flutter configuration and archive the release with Xcode.
 
    ```sh
-   flutter build ios --release --config-only --no-codesign
+   testflight_config_dir="$HOME/.config/doorbell-companion/testflight"
+   . "$testflight_config_dir/config" &&
+   flutter build ios --release --config-only --no-codesign &&
    xcodebuild archive -workspace ios/Runner.xcworkspace -scheme Runner \
      -configuration Release -destination 'generic/platform=iOS' \
      -archivePath build/ios/archive/DoorbellCompanion.xcarchive \
-     -allowProvisioningUpdates DEVELOPMENT_TEAM=N577R5DT64 CODE_SIGN_STYLE=Automatic
+     -allowProvisioningUpdates \
+     -authenticationKeyPath "$testflight_config_dir/AuthKey_${ASC_KEY_ID}.p8" \
+     -authenticationKeyID "$ASC_KEY_ID" \
+     -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+     DEVELOPMENT_TEAM=N577R5DT64 CODE_SIGN_STYLE=Automatic
    ```
 
 2. From `app/`, upload the signed archive using [`app/ios/TestFlightExportOptions.plist`](app/ios/TestFlightExportOptions.plist). These options mark the build as internal-only and preserve the version and build number from `pubspec.yaml`.
 
    ```sh
+   testflight_config_dir="$HOME/.config/doorbell-companion/testflight"
+   . "$testflight_config_dir/config" &&
    xcodebuild -exportArchive \
      -archivePath build/ios/archive/DoorbellCompanion.xcarchive \
      -exportPath build/ios/testflight \
      -exportOptionsPlist ios/TestFlightExportOptions.plist \
-     -allowProvisioningUpdates
+     -allowProvisioningUpdates \
+     -authenticationKeyPath "$testflight_config_dir/AuthKey_${ASC_KEY_ID}.p8" \
+     -authenticationKeyID "$ASC_KEY_ID" \
+     -authenticationKeyIssuerID "$ASC_ISSUER_ID"
    ```
 
 3. After Apple processes the upload, open the native **TestFlight** app on the Mac with an account in the **Internal** group. Select **Doorbell Companion → Previous Builds**, then select the version from `pubspec.yaml`. Confirm the exact build number is available to install or is already installed. The **Internal** group automatically distributes eligible builds. If the build is still processing or requires action, report the current status. [Apple’s internal testing guide](https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/)
