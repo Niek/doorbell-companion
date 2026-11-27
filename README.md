@@ -35,7 +35,7 @@ Expected support from Home Assistant Core source for [2026.11.3](https://github.
 | [Reolink](https://www.home-assistant.io/integrations/reolink/) | Two-way on supported models | Keep the default RTSP protocol. |
 | [UniFi Protect](https://www.home-assistant.io/integrations/unifiprotect/) | Listen only. Talkback in open go2rtc PRs [#2712](https://github.com/AlexxIT/go2rtc/pull/2712) and [#2340](https://github.com/AlexxIT/go2rtc/pull/2340). | Set up the integration with a local user, not API key only, or rings won't be detected. |
 | [Ring](https://www.home-assistant.io/integrations/ring/) | Listen only on stable. [Two-way in beta](https://github.com/home-assistant/core/pull/190763). | Keep **Last recording** disabled. |
-| [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only | Newer WebRTC models, such as the battery doorbell, are untested and show a placeholder until video starts. |
+| [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only | Newer WebRTC models, such as the battery doorbell, are untested and show a placeholder until video starts ([snapshots proposed](https://github.com/home-assistant/core/pull/194637)). |
 | [Axis I8116-E](https://www.home-assistant.io/integrations/axis/) | Listen only | Enable audio in the stream profile. |
 | [DoorBird](https://www.home-assistant.io/integrations/doorbird/) | None | Ring and live video. DoorBird's video stream has no audio. |
 | [HomeKit Device](https://www.home-assistant.io/integrations/homekit_controller/) | None | Ring and snapshots. Live video and talkback proposed in [Core #194068](https://github.com/home-assistant/core/pull/194068). |
