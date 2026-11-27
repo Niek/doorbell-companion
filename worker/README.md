@@ -2,9 +2,12 @@
 
 Stateless Cloudflare Worker that relays Home Assistant doorbell notifications for Doorbell Companion. Android uses FCM through `/push`, and iOS uses APNs VoIP through `/push/ios`.
 
-The `/android` and `/ios` pages declare the direct app callback for Home Assistant sign-in. Android `/push` responses include `Server-Timing` measurements for Google token acquisition and FCM submission, with the token cache hit or miss marked on `fcm_auth`.
+The `/android` and `/ios` pages declare the direct app callback (`doorbell-companion://auth-callback`) for Home Assistant sign-in. Push responses include `Server-Timing` measurements for auth token acquisition and delivery, marking cache hits/misses on `fcm_auth` (`/push`) and `apns_auth` (`/push/ios`).
 
-Home Assistant passes each user's Firebase registration token (`push_token`) directly in the `POST /push` request body, so a single deployed Worker serves any number of Home Assistant installations with zero database or stored user state.
+Home Assistant passes each device's `push_token` (an FCM registration token on `POST /push` or an environment-prefixed APNs VoIP token on `POST /push/ios`) directly in the request body, so a single deployed Worker serves any number of Home Assistant installations with zero database or stored user state.
+
+> [!NOTE]
+> Before deploying to your own Cloudflare account, remove or replace `account_id` in [`wrangler.jsonc`](wrangler.jsonc).
 
 ## Android setup
 
@@ -16,11 +19,11 @@ Home Assistant passes each user's Firebase registration token (`push_token`) dir
    npx wrangler deploy
    ```
 
-3. Point `PUSH_RELAY_URL` in `app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev/push` (or use the hosted default). Signing in to Home Assistant in Doorbell Companion sets up automatic ring notifications.
+3. Point `RELAY_BASE_URL` in `app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt` to `https://YOUR-WORKER.workers.dev` (or use the hosted default). Signing in to Home Assistant in Doorbell Companion sets up automatic ring notifications.
 
 ## iOS VoIP pushes
 
-Create an APNs signing key for the Doorbell Companion VoIP topic. Store a JSON secret named `APNS_SANDBOX_AUTH` for Debug builds and `APNS_PRODUCTION_AUTH` for production builds. The JSON fields are `team_id`, `key_id`, and `private_key`. The last field is the full PEM contents of the `.p8` key. An existing key that supports both environments can be stored as `APNS_AUTH`.
+Create an APNs signing key for the Doorbell Companion VoIP topic. Store a JSON secret named `APNS_SANDBOX_AUTH` for Debug builds and `APNS_PRODUCTION_AUTH` for Release builds. The JSON fields are `team_id`, `key_id`, and `private_key`. The last field is the full PEM contents of the `.p8` key. An existing key that supports both environments can be stored as `APNS_AUTH`.
 
 ```sh
 npx wrangler secret put APNS_SANDBOX_AUTH < /path/to/apns-sandbox-auth.json

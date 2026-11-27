@@ -2,45 +2,79 @@
 
 <h1 align="center">Doorbell Companion</h1>
 
-<p align="center">From doorbell press to talking with your visitor in under a second.<br>Live video calls for Home Assistant doorbells on Android and iOS.</p>
+<p align="center">
+  From doorbell press to talking with your visitor in under a second.<br>
+  Live video calls for Home Assistant doorbells on Android and iOS.
+</p>
+
+<p align="center">
+  <a href="https://play.google.com/apps/testing/nl.niek.doorbellcompanion"><img src="docs/badges/google-play.svg" height="44" alt="Join the Google Play open test for Android"></a>
+  <a href="https://testflight.apple.com/join/tQCjCUU6"><img src="docs/badges/testflight.svg" height="44" alt="Join the TestFlight beta for iPhone and iPad"></a>
+</p>
 
 <p align="center">
   <img src="docs/screenshots/call.jpg" width="300" alt="Call screen with live doorbell video">
 </p>
 
-Most doorbell notifications arrive late and open a slow camera view. Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, the native CallKit screen on iOS. The camera connects while it's still ringing, so it's ready when you answer.
+Doorbell manufacturer apps are painfully slow. A quiet notification arrives late, unlocking your phone and opening the app takes 10 seconds of loading spinners, and by the time the camera connects your visitor is already walking away.
 
-## Test builds
-
-<p>
-  <a href="https://play.google.com/apps/testing/nl.niek.doorbellcompanion"><img src="docs/badges/google-play.svg" height="44" alt="Join the Google Play open test for Android"></a>
-  <a href="https://testflight.apple.com/join/tQCjCUU6"><img src="docs/badges/testflight.svg" height="44" alt="Join the TestFlight beta for iPhone and iPad"></a>
-</p>
-
-Google Play enrollment requires a published open-test build. TestFlight enrollment requires a build approved for external testing.
+Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, or the native CallKit screen on iOS. It wakes your phone immediately and starts connecting the camera while it's still ringing, so live video and audio are already ready the moment you answer.
 
 ## Features
 
-- **Built for speed.** High-priority FCM and VoIP pushes ring the phone straight away. A snapshot shows instantly, WebRTC takes over at the first frame, and local and remote addresses are tried in parallel.
-- **Talkback.** Hear visitors, and talk back when the camera supports two-way audio.
-- **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the ring automation for you.
-- **Multiple doorbells.** Turn each one on or off in Settings.
+- **Rings like a real call.** High-priority FCM and APNs VoIP pushes break through immediately, ringing your phone instead of sending a notification you miss.
+- **Instant video.** Shows a snapshot right away, starts WebRTC while ringing so live video takes over at the first frame, and tries your local and remote addresses in parallel.
+- **Two-way audio.** Hear visitors immediately, and talk back when your camera supports two-way audio.
+- **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the shared ring automation for you.
+- **Multi-doorbell & multi-phone.** Turn each doorbell on or off per phone in Settings.
 
 ## Doorbell compatibility
 
-Expected support from Home Assistant Core source for [2026.11.3](https://github.com/home-assistant/core/tree/2026.11.3/homeassistant/components) and [2026.12.0b2](https://github.com/home-assistant/core/tree/2026.12.0b2/homeassistant/components).
+Based on Home Assistant Core [2026.11.3](https://github.com/home-assistant/core/tree/2026.11.3/homeassistant/components) and [2026.12.0b2](https://github.com/home-assistant/core/tree/2026.12.0b2/homeassistant/components) (not every model has been hardware-tested):
 
-| Home Assistant integration | Audio | Setup and limits |
+| Home Assistant integration | Audio | Setup and notes |
 | --- | --- | --- |
-| [Reolink](https://www.home-assistant.io/integrations/reolink/) | Two-way on supported models | Keep the default RTSP protocol. |
-| [UniFi Protect](https://www.home-assistant.io/integrations/unifiprotect/) | Listen only. Talkback in open go2rtc PRs [#2712](https://github.com/AlexxIT/go2rtc/pull/2712) and [#2340](https://github.com/AlexxIT/go2rtc/pull/2340). | Set up the integration with a local user, not API key only, or rings won't be detected. |
-| [Ring](https://www.home-assistant.io/integrations/ring/) | Listen only on stable. [Two-way in beta](https://github.com/home-assistant/core/pull/190763). | Keep **Last recording** disabled. |
-| [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only | Newer WebRTC models, such as the battery doorbell, are untested and show a placeholder until video starts ([snapshots proposed](https://github.com/home-assistant/core/pull/194637)). |
+| [Reolink](https://www.home-assistant.io/integrations/reolink/) | Two-way (supported models) | Keep the default RTSP protocol. |
+| [UniFi Protect](https://www.home-assistant.io/integrations/unifiprotect/) | Listen only | Set up with a local user (not API key only), or rings won't be detected. Talkback tracked in go2rtc [#2712](https://github.com/AlexxIT/go2rtc/pull/2712) and [#2340](https://github.com/AlexxIT/go2rtc/pull/2340). |
+| [Ring](https://www.home-assistant.io/integrations/ring/) | Listen only / Two-way (beta) | Keep **Last recording** disabled. Two-way audio added in [Core #190763](https://github.com/home-assistant/core/pull/190763). |
+| [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only | Newer WebRTC models (such as the battery doorbell) are untested and show a placeholder until video starts ([snapshots proposed](https://github.com/home-assistant/core/pull/194637)). |
 | [Axis I8116-E](https://www.home-assistant.io/integrations/axis/) | Listen only | Enable audio in the stream profile. |
-| [DoorBird](https://www.home-assistant.io/integrations/doorbird/) | None | Ring and live video. DoorBird's video stream has no audio. |
+| [DoorBird](https://www.home-assistant.io/integrations/doorbird/) | None | Ring and live video; DoorBird's video stream has no audio. |
 | [HomeKit Device](https://www.home-assistant.io/integrations/homekit_controller/) | None | Ring and snapshots. Live video and talkback proposed in [Core #194068](https://github.com/home-assistant/core/pull/194068). |
 
-For two-way audio, enable **Settings → System → Labs → Two-way audio** in Home Assistant.
+> [!NOTE]
+> For two-way audio, enable **Settings → System → Labs → Two-way audio** in Home Assistant.
+
+## Requirements
+
+- **Phone:** Android 8.1+ with Google Play Services, or iOS 15+.
+- **Home Assistant:** A supported doorbell with a WebRTC-compatible camera stream.
+- **Away from home:** An external Home Assistant URL configured for remote calls.
+
+<details>
+<summary>Custom or unlisted doorbells: how auto-discovery matches entities</summary>
+
+Doorbell press detection needs a `camera.*` entity and a press `binary_sensor.*` or `event.*` entity on the same Home Assistant device. The press entity must either:
+
+- have the `doorbell` device class or translation key,
+- have an entity ID ending in `_doorbell`, or
+- be a Reolink **Visitor** sensor.
+
+</details>
+
+## Setup
+
+1. Open the app on your home Wi-Fi and select your Home Assistant instance, or enter its URL.
+2. Sign in. The app discovers your doorbells and sets up one shared Home Assistant automation. Each phone can independently choose which doorbells call it.
+3. Allow **Notifications** (and **Full-screen calls** on Android). Allow **Microphone** access for talkback.
+4. Under a doorbell, tap **View** to check the camera, then tap **Test ring** and lock your phone during the 3-second countdown to test an incoming call.
+
+> [!TIP]
+> **UniFi Protect:** Enable the medium-resolution camera entity for faster video startup on cellular, then tap refresh in the app's **Settings** to rescan doorbells and update the shared automation.
+
+### Disconnecting and uninstalling
+
+Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the phone's doorbell subscriptions and Mobile App registration and revokes its Home Assistant session, while leaving the shared automation active for remaining phones.
 
 ## How it works
 
@@ -54,16 +88,11 @@ flowchart LR
     iOS --> Stream
 ```
 
-## Requirements
+## Build from source
 
-- Doorbell press detection needs a `camera.*` and a press `binary_sensor.*` or `event.*` on the same Home Assistant device. The press entity needs the `doorbell` device class or translation key, an entity ID ending in `_doorbell`, or to be a Reolink **Visitor** sensor.
-- Live video and audio need a compatible WebRTC stream. Calls away from home need your external Home Assistant URL.
-- Android 8.1+ with Google Play Services, or iOS 15+.
-- Flutter (Dart `^3.13`) to build.
+Requires Flutter (Dart `^3.13`).
 
-## Build
-
-**Android**
+### Android
 
 ```sh
 cd app
@@ -71,25 +100,25 @@ flutter build apk --release --split-per-abi
 adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ```
 
-**iOS.** Open `app/ios/Runner.xcworkspace`, pick your team, and enable Push Notifications for `nl.niek.doorbellcompanion`. Set `DOORBELL_COMPANION_APNS_ENVIRONMENT` to match your provisioning profile (Debug uses sandbox, Release uses production), then run `flutter run` from `app/`. [Relay setup for iOS](worker/README.md#ios-voip-pushes)
+### iOS
 
-## Setup
+1. Open `app/ios/Runner.xcworkspace` in Xcode, pick your team, and enable **Push Notifications** for `nl.niek.doorbellcompanion`.
+2. Set `DOORBELL_COMPANION_APNS_ENVIRONMENT` to match your provisioning profile (`development` for Debug/sandbox, `production` for Release).
+3. Run `flutter run` from `app/`.
 
-1. Open the app on your home Wi-Fi and pick your Home Assistant, or enter its URL.
-2. Sign in. The app finds your doorbells and sets up one shared Home Assistant automation. Each phone can choose which doorbells call it.
-3. Allow notifications, and on Android full-screen calls. Allow the microphone for talkback.
-4. Under a doorbell, tap **View** to check the camera, then **Test ring** and lock your phone within 3 seconds.
-
-Before uninstalling, use **Settings → Home Assistant → Disconnect** and wait for it to finish. This removes the phone’s doorbell subscriptions and Mobile App registration and revokes its Home Assistant session. The shared automation serves the remaining phones.
+For APNs VoIP relay configuration, see [Relay setup for iOS](worker/README.md#ios-voip-pushes).
 
 ## Self-hosting the relay
 
-The app uses a hosted relay by default. To run your own, follow the [Worker setup](worker/README.md) and point the app at it with `PUSH_RELAY_URL` in [HomeAssistantAuth.kt](app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt) (Android) and `DoorbellCompanionRelayURL` in [Info.plist](app/ios/Runner/Info.plist) (iOS).
+The app uses a hosted Cloudflare Worker relay by default. To run your own, follow the [Worker setup](worker/README.md) and update the relay base URL in:
 
-## Tips
+- **Android:** `RELAY_BASE_URL` in [HomeAssistantAuth.kt](app/android/app/src/main/kotlin/nl/niek/doorbellcompanion/HomeAssistantAuth.kt)
+- **iOS:** `DoorbellCompanionRelayURL` in [Info.plist](app/ios/Runner/Info.plist)
 
-- **UniFi Protect:** enable the medium-resolution camera entity for faster video startup on cellular. Tap refresh in the app’s Settings to rescan doorbells and update the shared automation.
-- **Timings:** run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I` on Android, or filter the Xcode console for `Doorbell Companion` on iOS.
+## Debugging timings
+
+- **Android:** `adb logcat -s DoorbellTiming:I DoorbellCompanion:I`
+- **iOS:** Filter the Xcode console for `Doorbell Companion`.
 
 ## License
 

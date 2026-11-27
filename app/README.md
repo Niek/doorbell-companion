@@ -2,17 +2,23 @@
 
 Fast incoming doorbell calls for Home Assistant on Android and iOS, with pre-warmed WebRTC live video and two-way audio when supported by the camera.
 
-For installation and setup, see the [project README](../README.md).
+For installation, compatibility, and setup, see the [project README](../README.md).
+
+## Shared behavior
+
+1. **Zero-typing Home Assistant onboarding:** Discovers Home Assistant over Wi-Fi and signs in through the browser using OAuth with PKCE (`/android` and `/ios` client IDs returning to `doorbell-companion://auth-callback`).
+2. **Doorbell discovery & warmup:** Pairs `camera.*` entities with press `binary_sensor.*` / `event.*` entities on the same device (matching the `doorbell` device class or translation key, an `_doorbell` entity ID suffix, or a Reolink **Visitor** sensor). Disables `preload_stream` so cameras such as UniFi Protect flush an immediate IDR keyframe on play, caches WebRTC ICE configuration, and refreshes expired OAuth tokens over the first reachable Home Assistant connection.
+3. **Pre-warmed sub-second WebRTC:** Races local LAN and external Home Assistant WebSockets in parallel with local SDP offer generation while the phone is still ringing, showing a snapshot immediately and switching to WebRTC at the first frame.
+4. **Two-way audio:** Negotiates send/receive audio upfront on supported cameras while keeping the microphone passive during ringing, then attaches the microphone as soon as you answer.
 
 ## Android
 
-1. **Zero-typing Home Assistant onboarding:** Discovers Home Assistant over Wi-Fi and signs in through your browser. Home Assistant instances that advertise PKCE show the hosted Doorbell Companion URL and return directly to the app. **Use local sign-in** is available if Home Assistant cannot reach the hosted page.
-2. **Automatic doorbell discovery & warmup:** Finds doorbell cameras (`binary_sensor.*_doorbell` / `event.*_doorbell` + `camera.*`), sets `preload_stream = false` so Protect flushes an immediate IDR keyframe on play, and caches WebRTC ICE configuration. Expired OAuth tokens refresh over the first available Home Assistant connection while the call starts.
-3. **Pre-warmed sub-second WebRTC:** When a high-priority FCM push arrives (`RingService`), Doorbell Companion races local LAN and external Home Assistant WebSockets in parallel with local WebRTC SDP offer generation at `t = 0 ms`—before Android finishes opening `CallActivity` on the lock screen.
-4. **Two-way audio:** Negotiates `SEND_RECV` audio upfront while keeping the microphone track passive during ringing; tapping **Answer** enables hardware echo-cancelled speakerphone and attaches the microphone immediately whenever the camera's SDP answer supports backchannel audio.
-
-For call startup diagnostics, inspect `adb logcat -s DoorbellTiming:I`.
+- A high-priority FCM push hits `RingService`, starting the Home Assistant connection and WebRTC offer at `t = 0 ms`—before Android finishes opening `CallActivity` full-screen on the lock screen.
+- Answering enables hardware echo-cancelled speakerphone and attaches the microphone when the camera's SDP answer accepts backchannel audio.
+- For call startup diagnostics, run `adb logcat -s DoorbellTiming:I DoorbellCompanion:I`.
 
 ## iOS
 
-PushKit receives calls from the APNs VoIP relay. CallKit presents the native incoming call screen while the app starts the WebRTC session. Answering opens the snapshot and live video in Doorbell Companion.
+- PushKit (`DoorbellCalls`) receives the APNs VoIP push and reports the incoming call to CallKit while `CameraCall` fetches the snapshot and starts the WebRTC session.
+- Answering activates the CallKit audio session and opens the live video view in Doorbell Companion.
+- For call startup diagnostics, filter the Xcode console for `Doorbell Companion`.

@@ -8,7 +8,7 @@ From this directory, redeploy the existing app with the local Docker engine.
 flyctl deploy --ha=false --no-public-ips --local-only --strategy immediate --wait-timeout 50s
 ```
 
-For a new app, create it on a dedicated network and deploy without a public IP. Finish Home Assistant onboarding over `flyctl proxy 18124:8123 --app doorbell-companion-review` at `http://127.0.0.1:18124` before assigning a shared public IPv4 address. The Dockerfile seeds the Home Assistant configuration only on an empty volume.
+For a new app, create it on a dedicated network and deploy without a public IP. Finish Home Assistant onboarding over `flyctl proxy 18124:8123 --app doorbell-companion-review` at `http://127.0.0.1:18124` before assigning a shared public IPv4 address. `start.sh` seeds the Home Assistant configuration only on an empty volume.
 
 ## Tester access
 
