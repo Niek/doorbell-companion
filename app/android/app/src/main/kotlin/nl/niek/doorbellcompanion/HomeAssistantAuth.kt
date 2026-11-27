@@ -653,6 +653,7 @@ object HomeAssistantAuth {
         }
 
         val friendlyNames = mutableMapOf<String, String>()
+        val doorbellStates = mutableSetOf<String>()
         val ringEvents = mutableSetOf<String>()
         for (i in 0 until states.length()) {
             val s = states.optJSONObject(i) ?: continue
@@ -660,6 +661,7 @@ object HomeAssistantAuth {
             val attributes = s.optJSONObject("attributes")
             val fn = attributes?.optString("friendly_name")
             if (eid.isNotBlank() && !fn.isNullOrBlank()) friendlyNames[eid] = fn
+            if (attributes?.optString("device_class") == "doorbell") doorbellStates.add(eid)
             val eventTypes = attributes?.optJSONArray("event_types") ?: continue
             if ((0 until eventTypes.length()).any { eventTypes.optString(it) == "ring" }) ringEvents.add(eid)
         }
@@ -689,7 +691,7 @@ object HomeAssistantAuth {
                     standaloneCameras.add(e)
                 }
             } else if ((entityId.startsWith("binary_sensor.") || entityId.startsWith("event.")) &&
-                (translationKey == "doorbell" || origClass == "doorbell" ||
+                (entityId in doorbellStates || translationKey == "doorbell" || origClass == "doorbell" ||
                     e.optString("device_class") == "doorbell" || entityId.endsWith("_doorbell"))
             ) {
                 if (deviceId.isNotBlank() && deviceId != "null") {
