@@ -39,7 +39,9 @@ When asked to **release a new version**, publish to **Internal testing** and sub
 
 Set the version and build number once in [`app/pubspec.yaml`](app/pubspec.yaml) and build both apps from the same checkout. For a new release, choose a number after `+` higher than every version code already uploaded to Google Play and every build number already uploaded for the same iOS version.
 
-Verify the exact version and build number on every track and group. If a track or group already has the intended build, continue with the remaining destinations. Report submissions awaiting review separately from builds available to testers.
+The Mac is usually locked. Verify the exact version and build number on each track and group using the stores' APIs or consoles. A routine release can finish with store-side verification. Check native TestFlight or install on a device only when specifically requested and the necessary device is accessible.
+
+If a track or group already has the intended build, continue with the remaining destinations. Report each store's status, including uploads still processing and submissions awaiting review. Once submitted, report any pending review and finish the release task.
 
 ### Publish an Android test build
 
@@ -63,7 +65,7 @@ Install `gplay` with `brew install PollyGlot/tap/gplay`. The `doorbell-play-publ
      --version-code "$version_code" --complete
    ```
 
-4. Read both tracks back from Google Play. Verify the version code on each track and confirm Internal testing is `completed`. Check **Publishing overview** in Play Console for the Open testing release. Submit it if Play is waiting for **Send for review**, and report whether it is in review, ready to publish, or available to testers. [Google Play publishing guide](https://support.google.com/googleplay/android-developer/answer/9859654)
+4. Read both tracks back from Google Play. Verify the version code on each track and confirm Internal testing is `completed`. Check **Publishing overview** in Play Console for the Open testing release. Use **Send for review** if Play is waiting for it. If quick checks say Play will submit automatically, leave the submission to Play. Report the current status from Publishing overview, such as running quick checks, in review, ready to publish, or available to testers. [Google Play publishing guide](https://support.google.com/googleplay/android-developer/answer/9859654)
 
    ```sh
    gplay tracks list --account doorbell-play-publisher \
@@ -71,7 +73,7 @@ Install `gplay` with `brew install PollyGlot/tap/gplay`. The `doorbell-play-publ
      --output table --columns track,release,status,versionCodes
    ```
 
-   To verify delivery, install or update through Google Play with an account in the **Niek** tester group and confirm the installed build. The update can take a few minutes to appear after Play reports `completed`. [Internal test invite](https://play.google.com/apps/internaltest/4700516454089035458)
+   For a requested install check, use Google Play with an account in the **Niek** tester group and confirm the installed build. [Internal test invite](https://play.google.com/apps/internaltest/4700516454089035458)
 
 ### Publish an iOS TestFlight build
 
@@ -93,7 +95,7 @@ Use the **Doorbell Companion TestFlight** App Store Connect API key for **Nivade
      DEVELOPMENT_TEAM=N577R5DT64 CODE_SIGN_STYLE=Automatic
    ```
 
-2. From `app/`, upload the signed archive using [`app/ios/TestFlightExportOptions.plist`](app/ios/TestFlightExportOptions.plist). These options allow external TestFlight distribution and preserve the version and build number from `pubspec.yaml`.
+2. From `app/`, upload the signed archive using [`app/ios/TestFlightExportOptions.plist`](app/ios/TestFlightExportOptions.plist). These options allow external TestFlight distribution and preserve the version and build number from `pubspec.yaml`. A successful `xcodebuild` upload confirms Apple received the build. Check App Store Connect for processing and distribution status.
 
    ```sh
    testflight_config_dir="$HOME/.config/doorbell-companion/testflight"
@@ -110,4 +112,4 @@ Use the **Doorbell Companion TestFlight** App Store Connect API key for **Nivade
 
 3. After Apple processes the upload, add the exact build to **Doorbell Companion → TestFlight → Private Beta → Builds** in App Store Connect with an Account Holder, Admin, or App Manager account. Enter **What to Test**, enable **Automatically notify testers**, then choose **Submit Review** or **Start Testing**, depending on the build's status. Check the exact build's status for **Private Beta** and report whether it is awaiting review or available. [Apple’s external testing guide](https://developer.apple.com/help/app-store-connect/test-a-beta-version/invite-external-testers/)
 
-4. The **Internal** group automatically distributes eligible builds. Open the native **TestFlight** app on the Mac with an account in that group. Under **Doorbell Companion → Previous Builds**, select the version from `pubspec.yaml` and confirm the exact build is available to install or is already installed. [Apple’s internal testing guide](https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/)
+4. The **Internal** group automatically distributes eligible builds. In App Store Connect, confirm the exact version and build number appear under **Doorbell Companion → TestFlight → Internal → Builds** and are in testing. The App Store Connect API can also verify the group's build membership and the build's `IN_BETA_TESTING` internal status. [Apple’s internal testing guide](https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/)
