@@ -8,7 +8,7 @@
   <img src="docs/screenshots/call.jpg" width="300" alt="Call screen with live doorbell video">
 </p>
 
-Most doorbell notifications arrive late and open a slow camera view. Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, the native CallKit screen on iOS. The camera connects while it's still ringing, so video and audio are live the moment you answer. Works with any Home Assistant doorbell, including UniFi Protect.
+Most doorbell notifications arrive late and open a slow camera view. Doorbell Companion rings your phone like a real call instead: a full-screen call on Android, the native CallKit screen on iOS. The camera connects while it's still ringing, so it's ready when you answer.
 
 ## Test builds
 
@@ -26,6 +26,22 @@ Google Play enrollment requires a published open-test build. TestFlight enrollme
 - **One-tap setup.** Finds Home Assistant on your Wi-Fi, signs in through the browser, and creates the ring automation for you.
 - **Multiple doorbells.** Turn each one on or off in Settings.
 
+## Doorbell compatibility
+
+Expected support in Doorbell Companion with official integrations, based on [Home Assistant Core 2026.11.3 source](https://github.com/home-assistant/core/tree/2026.11.3/homeassistant/components).
+
+| Home Assistant integration | Audio | Setup and limits |
+| --- | --- | --- |
+| [Reolink](https://www.home-assistant.io/integrations/reolink/) | Two-way on supported models | Use RTSP and rename the Visitor entity ID to end in `_doorbell` for ring detection. |
+| [UniFi Protect](https://www.home-assistant.io/integrations/unifiprotect/) | Listen only | Add a local Protect user for rings. Open talkback PRs [go2rtc #2712](https://github.com/AlexxIT/go2rtc/pull/2712) and [#2340](https://github.com/AlexxIT/go2rtc/pull/2340). |
+| [Ring](https://www.home-assistant.io/integrations/ring/) | Listen only on stable | Use Live View. Two-way audio in the 2026.12 beta ([Core #190763](https://github.com/home-assistant/core/pull/190763)). |
+| [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only with RTSP | Native WebRTC models currently ring without live video or audio in the app. |
+| [Axis I8116-E](https://www.home-assistant.io/integrations/axis/) | Listen only | Enable audio in the stream profile. |
+| [DoorBird](https://www.home-assistant.io/integrations/doorbird/) | None | Ring and live video. |
+| [HomeKit Device](https://www.home-assistant.io/integrations/homekit_controller/) | None | Ring and snapshots. Live video and talkback proposed in [Core #194068](https://github.com/home-assistant/core/pull/194068). |
+
+For two-way audio, enable **Settings → System → Labs → Two-way audio** in Home Assistant.
+
 ## How it works
 
 ```mermaid
@@ -40,7 +56,7 @@ flowchart LR
 
 ## Requirements
 
-- Home Assistant with WebRTC (go2rtc), a `camera.*` doorbell, and a doorbell `binary_sensor.*` or `event.*`. Calls away from home need your external Home Assistant URL.
+- Home Assistant with a WebRTC-capable `camera.*` and a doorbell `binary_sensor.*` or `event.*` on the same device. Calls away from home need your external Home Assistant URL.
 - Android 8.1+ with Google Play Services, or iOS 15+.
 - Flutter (Dart `^3.13`) to build.
 
