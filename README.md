@@ -64,10 +64,15 @@ Doorbell press detection needs a `camera.*` entity and a press `binary_sensor.*`
 
 ### Camera and a separate button?
 
-1. In Home Assistant, create a [Template Binary Sensor](https://www.home-assistant.io/integrations/template/#binary-sensor) helper. Set **Device** to the camera's Home Assistant device and **State** to `{{ is_state('binary_sensor.your_button', 'on') }}`.
-2. Set the helper's entity ID to end in `_doorbell` (for example, `binary_sensor.front_door_doorbell`), then refresh Doorbell Companion in **Settings**.
+Doorbell Companion pairs a camera with a button on the same Home Assistant device. If your camera and button are separate devices, attach a virtual doorbell sensor to your camera:
 
-If the button only fires an event, use an automation to briefly turn a [Toggle helper](https://www.home-assistant.io/integrations/input_boolean/) on and back off, and use that toggle in the template.
+1. In Home Assistant, go to **Settings → Devices & services → Helpers** and create a [Template Binary Sensor](https://www.home-assistant.io/integrations/template/#binary-sensor):
+   - **Name:** End with `Doorbell` (for example, `Front Door Doorbell`) so its entity ID ends in `_doorbell`.
+   - **State:** `{{ is_state('binary_sensor.your_button', 'on') }}`, replacing `binary_sensor.your_button` with your button's entity ID.
+   - **Device:** Select your camera's Home Assistant device.
+2. In Doorbell Companion, open **Settings** and tap refresh.
+
+**Button only fires events (no on/off sensor)?** Create a [Toggle helper](https://www.home-assistant.io/integrations/input_boolean/), add an automation that turns it on and back off when the button is pressed, and use that `input_boolean.*` entity in **State** above.
 
 ## Setup
 
