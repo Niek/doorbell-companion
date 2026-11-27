@@ -44,9 +44,10 @@
         <activity
             android:name=".CallActivity"
             android:exported="false"
+            android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|locale|layoutDirection|fontScale|uiMode"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
         <receiver android:name=".DeclineReceiver" android:exported="false" />
         <service android:name=".RingtoneService" android:exported="false" android:foregroundServiceType="mediaPlayback" />

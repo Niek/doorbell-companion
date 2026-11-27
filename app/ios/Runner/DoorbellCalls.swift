@@ -13,9 +13,33 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     let media: CameraCall
     let usesCallKit: Bool
     var answered = false
+    var snapshotData: Data?
+    var notificationTask: Task<Void, Never>?
+  }
+
+  @MainActor
+  private final class BackgroundTaskToken {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init(name: String) {
+      id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+        MainActor.assumeIsolated { self?.end() }
+      }
+    }
+
+    func end() {
+      guard id != .invalid else { return }
+      UIApplication.shared.endBackgroundTask(id)
+      id = .invalid
+    }
   }
 
   private static let ringTimeoutNanoseconds: UInt64 = 30_000_000_000
+  private static let missedFallbackDelaySeconds: TimeInterval = 31
+
+  private static func missedFallbackIdentifier(for callID: UUID) -> String {
+    "\(callID.uuidString)-missed"
+  }
 
   private let home: HomeAssistant
   private let provider: CXProvider
@@ -103,7 +127,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     if available, let bell {
       let media = makeMedia(bell, workerTimeMs: workerTimeMs, eventTimeMs: eventTimeMs)
       media.snapshotReady = { [weak self] data in
-        self?.postSnapshot(data, callID: id, doorbellName: bell.name)
+        self?.handleSnapshot(data, callID: id, doorbellName: bell.name)
       }
       active = Incoming(id: id, media: media, usesCallKit: true)
     }
@@ -113,7 +137,12 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
         guard let self else { return }
         if let error {
           NSLog("Doorbell Companion CallKit: %@", error.localizedDescription)
-          if available { self.finish(id) }
+          if available {
+            let previousTask = self.active?.id == id ? self.active?.notificationTask : nil
+            previousTask?.cancel()
+            self.clearNotification(for: id, after: previousTask)
+            self.finish(id)
+          }
         } else if !available {
           self.provider.reportCall(with: id, endedAt: Date(), reason: .failed)
         }
@@ -123,13 +152,32 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
       NSLog("Doorbell Companion CallKit: VoIP invite reported")
       prewarmBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Connect doorbell camera") {
         [weak self] in
-        Task { @MainActor in self?.endPrewarmBackgroundTask() }
+        MainActor.assumeIsolated { self?.endPrewarmBackgroundTask() }
+      }
+      // Schedule an OS-timed fallback so a missed alert still fires if iOS suspends the app before 30s.
+      if let doorbellName = active?.media.bell.name {
+        active?.notificationTask = scheduleMissedFallbackNotification(callID: id, doorbellName: doorbellName)
       }
       active?.media.start()
       timeout = Task { [weak self] in
         try? await Task.sleep(nanoseconds: Self.ringTimeoutNanoseconds)
-        guard !Task.isCancelled, let self, self.active?.answered == false else { return }
+        guard !Task.isCancelled, let self, let active = self.active, active.id == id, !active.answered else { return }
+        let doorbellName = active.media.bell.name
+        let snapshotData = active.snapshotData
+        let previousTask = active.notificationTask
+        previousTask?.cancel()
         self.provider.reportCall(with: id, endedAt: Date(), reason: .unanswered)
+        // Acquire the missed-call background task before finish() releases prewarmBackgroundTask.
+        self.postDoorbellNotification(
+          callID: id,
+          doorbellName: doorbellName,
+          body: "Missed doorbell",
+          snapshot: snapshotData,
+          onlyWhileRinging: false,
+          backgroundTaskName: "Post missed doorbell notification",
+          after: previousTask,
+          removeFallback: true
+        )
         self.finish(id)
       }
     }
@@ -183,15 +231,23 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   }
 
   func providerDidReset(_ provider: CXProvider) {
-    if let active { finish(active.id) }
+    if let active {
+      let previousTask = active.notificationTask
+      previousTask?.cancel()
+      clearNotification(for: active.id, after: previousTask)
+      finish(active.id)
+    }
   }
 
   func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
     guard active?.id == action.callUUID else { action.fail(); return }
     timeout?.cancel()
+    let previousTask = active?.notificationTask
+    previousTask?.cancel()
+    active?.notificationTask = nil
     active?.answered = true
-    // The live camera replaces the snapshot, so drop the ring notification.
-    UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [action.callUUID.uuidString])
+    // The live camera replaces the snapshot, so drop the ring notification and missed fallback.
+    clearNotification(for: action.callUUID, after: previousTask)
     configureAudioSession()
     active?.media.answer()
     action.fulfill()
@@ -206,6 +262,9 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   }
 
   func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    let previousTask = active?.id == action.callUUID ? active?.notificationTask : nil
+    previousTask?.cancel()
+    clearNotification(for: action.callUUID, after: previousTask)
     finish(action.callUUID)
     action.fulfill()
   }
@@ -266,6 +325,7 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     guard let active, active.id == id else { return }
     timeout?.cancel()
     timeout = nil
+    active.notificationTask?.cancel()
     endPrewarmBackgroundTask()
     cameraView?.detach()
     active.media.close()
@@ -279,33 +339,123 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   }
 
   /// CallKit can't show images, so a ringing call also posts the doorbell snapshot as a notification.
-  /// It stays in Notification Center unless the call is answered, so a missed ring still shows who was there.
-  private func postSnapshot(_ data: Data, callID: UUID, doorbellName: String) {
-    func ringing() -> Bool { active?.id == callID && active?.answered == false }
-    guard ringing() else { return }
+  /// Answered or declined calls clear it; unanswered calls replace it with a "Missed doorbell" alert.
+  private func handleSnapshot(_ data: Data, callID: UUID, doorbellName: String) {
+    guard active?.id == callID, active?.answered == false else { return }
+    active?.snapshotData = data
+    let previousTask = active?.notificationTask
+    active?.notificationTask = postDoorbellNotification(
+      callID: callID,
+      doorbellName: doorbellName,
+      body: "Someone is at the door",
+      snapshot: data,
+      onlyWhileRinging: true,
+      backgroundTaskName: "Post doorbell snapshot",
+      after: previousTask
+    )
+  }
+
+  private func scheduleMissedFallbackNotification(callID: UUID, doorbellName: String) -> Task<Void, Never> {
     let center = UNUserNotificationCenter.current()
-    // Declining ends the call's background task, so keep the app awake until the request is handed off.
-    let background = UIApplication.shared.beginBackgroundTask(withName: "Post doorbell snapshot")
-    Task {
-      defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
+    let token = BackgroundTaskToken(name: "Schedule missed doorbell fallback")
+    let fallbackID = Self.missedFallbackIdentifier(for: callID)
+    return Task { [weak self] in
+      defer { token.end() }
       let status = await center.notificationSettings().authorizationStatus
-      guard [.authorized, .provisional, .ephemeral].contains(status), ringing() else { return }
-      let isPNG = data.starts(with: [0x89, 0x50, 0x4E, 0x47])
-      let file = FileManager.default.temporaryDirectory
-        .appendingPathComponent(callID.uuidString).appendingPathExtension(isPNG ? "png" : "jpg")
+      guard !Task.isCancelled,
+            [.authorized, .provisional, .ephemeral].contains(status),
+            self?.active?.id == callID,
+            self?.active?.answered == false else { return }
+      let content = UNMutableNotificationContent()
+      content.title = doorbellName
+      content.body = "Missed doorbell"
+      content.threadIdentifier = "doorbell"
+      let trigger = UNTimeIntervalNotificationTrigger(timeInterval: Self.missedFallbackDelaySeconds, repeats: false)
       do {
-        try data.write(to: file)
+        try await center.add(UNNotificationRequest(identifier: fallbackID, content: content, trigger: trigger))
+      } catch {
+        NSLog("Doorbell Companion missed fallback notification: %@", error.localizedDescription)
+      }
+    }
+  }
+
+  @discardableResult
+  private func postDoorbellNotification(
+    callID: UUID,
+    doorbellName: String,
+    body: String,
+    snapshot: Data?,
+    onlyWhileRinging: Bool,
+    backgroundTaskName: String,
+    after previousTask: Task<Void, Never>? = nil,
+    removeFallback: Bool = false
+  ) -> Task<Void, Never> {
+    let center = UNUserNotificationCenter.current()
+    let fallbackID = Self.missedFallbackIdentifier(for: callID)
+    if removeFallback {
+      center.removePendingNotificationRequests(withIdentifiers: [fallbackID])
+      center.removeDeliveredNotifications(withIdentifiers: [fallbackID])
+    }
+    // Keep the app awake until the notification request is handed off to the system.
+    let token = BackgroundTaskToken(name: backgroundTaskName)
+    return Task { [weak self] in
+      defer { token.end() }
+      await previousTask?.value
+      if removeFallback {
+        center.removePendingNotificationRequests(withIdentifiers: [fallbackID])
+        center.removeDeliveredNotifications(withIdentifiers: [fallbackID])
+      }
+      guard !Task.isCancelled else { return }
+      let status = await center.notificationSettings().authorizationStatus
+      guard !Task.isCancelled, [.authorized, .provisional, .ephemeral].contains(status) else { return }
+      if onlyWhileRinging {
+        guard self?.active?.id == callID, self?.active?.answered == false else { return }
+      }
+      var tempFile: URL?
+      do {
         let content = UNMutableNotificationContent()
         content.title = doorbellName
-        content.body = "Someone is at the door"
+        content.body = body
         content.threadIdentifier = "doorbell"
-        content.attachments = [try UNNotificationAttachment(identifier: "snapshot", url: file)]
+        if let snapshot {
+          let isPNG = snapshot.starts(with: [0x89, 0x50, 0x4E, 0x47])
+          let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension(isPNG ? "png" : "jpg")
+          try snapshot.write(to: file)
+          tempFile = file
+          content.attachments = [try UNNotificationAttachment(identifier: "snapshot", url: file)]
+        }
+        guard !Task.isCancelled else {
+          if let tempFile { try? FileManager.default.removeItem(at: tempFile) }
+          return
+        }
+        if onlyWhileRinging {
+          guard self?.active?.id == callID, self?.active?.answered == false else {
+            if let tempFile { try? FileManager.default.removeItem(at: tempFile) }
+            return
+          }
+        }
         try await center.add(UNNotificationRequest(identifier: callID.uuidString, content: content, trigger: nil))
       } catch {
-        NSLog("Doorbell Companion snapshot notification: %@", error.localizedDescription)
+        NSLog("Doorbell Companion notification: %@", error.localizedDescription)
       }
       // A delivered attachment has already been moved out of tmp, so this only cleans up failures.
-      try? FileManager.default.removeItem(at: file)
+      if let tempFile { try? FileManager.default.removeItem(at: tempFile) }
+    }
+  }
+
+  private func clearNotification(for callID: UUID, after previousTask: Task<Void, Never>?) {
+    let identifiers = [callID.uuidString, Self.missedFallbackIdentifier(for: callID)]
+    let center = UNUserNotificationCenter.current()
+    center.removePendingNotificationRequests(withIdentifiers: identifiers)
+    center.removeDeliveredNotifications(withIdentifiers: identifiers)
+    guard let previousTask else { return }
+    let token = BackgroundTaskToken(name: "Clear doorbell snapshot")
+    Task {
+      defer { token.end() }
+      await previousTask.value
+      center.removePendingNotificationRequests(withIdentifiers: identifiers)
+      center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
   }
 

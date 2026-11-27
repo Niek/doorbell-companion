@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
@@ -68,6 +69,7 @@ class CallActivity : Activity() {
     private var fillScreen = true
     private var answered = false
     private var muted = false
+    private var ringId: Long = 0L
     private var doorbellName: String = "Doorbell"
     private var callStart = SystemClock.elapsedRealtime()
     private var timing = CallTiming.current
@@ -146,13 +148,66 @@ class CallActivity : Activity() {
     }
 
     private fun dismissCall() {
-        HomeAssistantPrewarm.cancel()
-        RingNotification.stop(this)
+        if (!answered) {
+            if (ringId != 0L) {
+                RingNotification.decline(this, onlyIfRingId = ringId, activity = this)
+            } else {
+                RingNotification.detachCall(this)
+                if (!RingNotification.hasActiveRing()) HomeAssistantPrewarm.cancel()
+            }
+        } else {
+            RingNotification.detachCall(this)
+        }
         finish()
+    }
+
+    fun finishFromRingEnd() {
+        if (answered || isFinishing || isDestroyed) return
+        timing?.mark("ring_auto_dismissed")
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        finish()
+    }
+
+    fun updateUnansweredRing(newRingId: Long, newDoorbellName: String) {
+        if (answered || isFinishing || isDestroyed) return
+        ringId = newRingId
+        doorbellName = newDoorbellName
+        if (::title.isInitialized) {
+            title.text = doorbellName
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt("pid", Process.myPid())
+        outState.putBoolean("answered", answered)
+        outState.putBoolean("muted", muted)
+        outState.putLong("ring_id", ringId)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val sameProcessState = savedInstanceState?.takeIf { it.getInt("pid", -1) == Process.myPid() }
+        val adoptedRing = if (savedInstanceState != null && sameProcessState == null) {
+            RingNotification.currentRing() ?: run {
+                finish()
+                return
+            }
+        } else {
+            null
+        }
+        ringId = adoptedRing?.ringId
+            ?: sameProcessState?.getLong("ring_id", 0L)
+            ?: intent.getLongExtra(RingNotification.EXTRA_RING_ID, 0L)
+        muted = sameProcessState?.getBoolean("muted", false) == true
+        val startAnswered = adoptedRing == null && (
+            (sameProcessState?.getBoolean("answered", false) == true) ||
+                intent.getBooleanExtra("answer", false)
+            )
+        if (!startAnswered && ringId != 0L && !RingNotification.attachUnansweredCall(ringId, this)) {
+            finish()
+            return
+        }
         callStart = SystemClock.elapsedRealtime()
         timing?.mark("activity_created")
         setShowWhenLocked(true)
@@ -183,7 +238,8 @@ class CallActivity : Activity() {
             }
         }
 
-        doorbellName = intent.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() }
+        doorbellName = adoptedRing?.doorbellName?.takeIf { it.isNotBlank() }
+            ?: intent.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() }
             ?: HomeAssistantAuth.prefs(this).getString("last_doorbell_name", "Doorbell") ?: "Doorbell"
 
         val root = FrameLayout(this).apply {
@@ -330,20 +386,31 @@ class CallActivity : Activity() {
 
         setContentView(root)
 
-        startHomeAssistantCamera(intent.getStringExtra("camera_entity_id"))
-        if (intent.getBooleanExtra("answer", false)) answerCall()
+        if (muted) {
+            muteBtn.update(R.drawable.ic_mic_off, "Unmute")
+        }
+        startHomeAssistantCamera(adoptedRing?.cameraEntityId ?: intent.getStringExtra("camera_entity_id"))
+        if (startAnswered) answerCall()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        val incomingRingId = intent.getLongExtra(RingNotification.EXTRA_RING_ID, 0L)
+        val incomingAnswer = intent.getBooleanExtra("answer", false)
+        val incomingCamera = intent.getStringExtra("camera_entity_id")
+        if (!incomingAnswer && incomingRingId != 0L && !RingNotification.attachUnansweredCall(incomingRingId, this)) {
+            if (!answered) finishFromRingEnd()
+            return
+        }
         setIntent(intent)
+        ringId = incomingRingId
         callStart = SystemClock.elapsedRealtime()
         timing = CallTiming.current
         timing?.mark("activity_new_intent")
         doorbellName = intent.getStringExtra("doorbell_name")?.takeIf { it.isNotBlank() }
             ?: HomeAssistantAuth.prefs(this).getString("last_doorbell_name", doorbellName) ?: doorbellName
-        val incomingCamera = intent.getStringExtra("camera_entity_id")
-        if (intent.getBooleanExtra("answer", false)) {
+        if (incomingAnswer) {
+            RingNotification.detachCall(this)
             if (!incomingCamera.isNullOrBlank() && incomingCamera != activeCameraEntityId) {
                 releaseWebRtcView()
                 startHomeAssistantCamera(incomingCamera)
@@ -456,6 +523,7 @@ class CallActivity : Activity() {
         rendererInitialized = true
         applyScalingMode()
 
+        val currentRingId = ringId
         connection.attachListeners(
             videoListener = { track ->
                 runOnUiThread {
@@ -502,7 +570,12 @@ class CallActivity : Activity() {
                         setStatus("Connecting live video…")
                     }
                 }
-            }
+            },
+            ringSnapshotListener = if (!answered && currentRingId != 0L) {
+                { bitmap -> RingNotification.recordSnapshot(currentRingId, bitmap) }
+            } else {
+                null
+            },
         )
 
         if (!isCurrent()) return
@@ -575,7 +648,12 @@ class CallActivity : Activity() {
     }
 
     private fun answerCall() {
-        RingNotification.stop(this)
+        RingNotification.detachCall(this)
+        if (ringId != 0L) {
+            RingNotification.stopIfCurrent(this, ringId)
+        } else {
+            RingNotification.stop(this)
+        }
         if (!answered) {
             configureCallAudio(getSystemService(AudioManager::class.java))
             answered = true
@@ -583,6 +661,7 @@ class CallActivity : Activity() {
         }
         val twoWay = HomeAssistantAuth.supportsTwoWayAudio(this, activeCameraEntityId)
         val hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        haRemote?.setMicMuted(muted)
         haRemote?.answer(hasMic)
         if (twoWay && !hasMic) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 101)
@@ -602,11 +681,16 @@ class CallActivity : Activity() {
 
     override fun onDestroy() {
         timing?.mark("activity_destroyed")
-        if (isFinishing) {
-            RingNotification.stop(this)
-            if (!answered) HomeAssistantPrewarm.cancel()
+        RingNotification.detachCall(this)
+        if (isFinishing && !answered) {
+            val stopped = RingNotification.stopIfCurrent(this, ringId)
+            if (stopped || (ringId == 0L && !RingNotification.hasActiveRing())) {
+                HomeAssistantPrewarm.cancel()
+            }
         }
-        releaseWebRtcView()
+        if (::remoteVideo.isInitialized) {
+            releaseWebRtcView()
+        }
         releaseAudio()
         super.onDestroy()
     }

@@ -261,15 +261,19 @@ class HomeAssistantRemote(
         failureListener: (Failure) -> Unit,
         micStateListener: (Boolean) -> Unit = {},
         snapshotListener: (Bitmap) -> Unit = {},
+        ringSnapshotListener: ((Bitmap) -> Unit)? = null,
     ) {
         onVideo = videoListener
         status = statusListener
         onFailure = failureListener
         onMicState = micStateListener
         onSnapshot = snapshotListener
-        ringSnapshotListener = null
+        this.ringSnapshotListener = ringSnapshotListener
         statusListener(latestStatus)
-        latestSnapshot?.let(snapshotListener)
+        latestSnapshot?.let { bmp ->
+            snapshotListener(bmp)
+            ringSnapshotListener?.invoke(bmp)
+        }
         currentVideoTrack?.let(videoListener)
         micStateListener(micAttached)
         failure?.let(failureListener)
@@ -823,6 +827,8 @@ class HomeAssistantRemote(
 
     fun answer(allowMicrophone: Boolean) {
         answered = true
+        ringSnapshotListener = null
+        if (!needsSnapshot()) cancelSnapshotCalls()
         microphoneAllowed = allowMicrophone
         schedule {
             remoteAudio?.setEnabled(true)
