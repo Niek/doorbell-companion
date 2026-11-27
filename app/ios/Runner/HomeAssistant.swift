@@ -12,6 +12,31 @@ struct HAAuthRejectedError: LocalizedError {
   var errorDescription: String? { "Home Assistant rejected the session" }
 }
 
+struct HARefreshRejectedError: LocalizedError {
+  var errorDescription: String? { "Sign in to Home Assistant again" }
+}
+
+struct HARefreshFailedError: LocalizedError {
+  let retryable: Bool
+  var errorDescription: String? { "Could not refresh Home Assistant sign-in" }
+}
+
+struct HAWebSocketUnavailableError: LocalizedError {
+  var errorDescription: String? { "Home Assistant WebSocket is unreachable" }
+}
+
+func isHomeAssistantTransportError(_ failure: Error) -> Bool {
+  let error = failure as NSError
+  if error.domain == NSPOSIXErrorDomain {
+    return [ECONNABORTED, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT, ENETDOWN, ENETUNREACH, EHOSTUNREACH]
+      .contains(Int32(error.code))
+  }
+  guard error.domain == NSURLErrorDomain else { return false }
+  return [URLError.timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+          .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable, .dataNotAllowed]
+    .contains(URLError.Code(rawValue: error.code))
+}
+
 struct HAHTTPError: LocalizedError {
   let status: Int
   let path: String
@@ -200,28 +225,41 @@ final class HomeAssistant {
       "client_id": credentials.clientID,
     ]
     let task = Task {
-      let refreshed = await withTaskGroup(of: HACredentials?.self, returning: HACredentials?.self) { group in
+      let refreshed = try await withThrowingTaskGroup(of: Result<HACredentials, Error>.self) { group in
         for endpoint in candidates {
           group.addTask { @MainActor in
-            guard let response = try? await self.tokenResponse(url: endpoint, fields: fields),
-                  let access = response["access_token"] as? String, !access.isEmpty else { return nil }
-            var updated = credentials
-            updated.accessToken = access
-            updated.expiration = Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
-            return updated
+            do {
+              let response = try await self.tokenResponse(url: endpoint, fields: fields)
+              guard let access = response["access_token"] as? String, !access.isEmpty else {
+                throw DoorbellCompanionError("Home Assistant did not return an access token")
+              }
+              var updated = credentials
+              updated.accessToken = access
+              updated.expiration = Date().addingTimeInterval(response["expires_in"] as? Double ?? 1800)
+              return .success(updated)
+            } catch {
+              return .failure(error)
+            }
           }
         }
-        for await result in group {
-          if let result {
+        var rejected = false
+        var onlyTransportFailures = !candidates.isEmpty
+        for try await result in group {
+          switch result {
+          case .success(let updated):
             group.cancelAll()
-            return result
+            return updated
+          case .failure(let error):
+            if error is HARefreshRejectedError { rejected = true }
+            if !isHomeAssistantTransportError(error) { onlyTransportFailures = false }
           }
         }
-        return nil
+        try Task.checkCancellation()
+        if rejected { throw HARefreshRejectedError() }
+        throw HARefreshFailedError(retryable: onlyTransportFailures)
       }
       try Task.checkCancellation()
       guard self.credentials?.refreshToken == credentials.refreshToken else { throw CancellationError() }
-      guard let refreshed else { throw DoorbellCompanionError("Home Assistant could not refresh sign-in credentials") }
       try Self.saveCredentials(refreshed)
       self.credentials = refreshed
       return refreshed.accessToken
@@ -274,6 +312,8 @@ final class HomeAssistant {
     enum Attempt {
       case connected(HASocket)
       case authRejected
+      case refreshRejected
+      case refreshFailed(HARefreshFailedError)
       case failed
       case timeout
     }
@@ -289,17 +329,31 @@ final class HomeAssistant {
             return .connected(socket)
           } catch is HAAuthRejectedError {
             return .authRejected
+          } catch is HARefreshRejectedError {
+            return .refreshRejected
+          } catch let error as HARefreshFailedError {
+            return .refreshFailed(error)
           } catch {
             return .failed
           }
         }
       }
       group.addTask {
+        // The socket exchange gets its own deadline after the shared refresh finishes.
+        do {
+          _ = try await tokenTask.value
+        } catch is HARefreshRejectedError {
+          return .refreshRejected
+        } catch let error as HARefreshFailedError {
+          return .refreshFailed(error)
+        } catch {
+          return .timeout
+        }
         try? await Task.sleep(nanoseconds: 8_000_000_000)
         return .timeout
       }
       var pending = endpoints.count
-      var sawAuthRejected = false
+      var failure = Attempt.failed
       while let result = await group.next() {
         switch result {
         case .connected(let socket):
@@ -309,9 +363,12 @@ final class HomeAssistant {
           }
           return .connected(socket)
         case .authRejected:
-          sawAuthRejected = true
+          failure = .authRejected
           pending -= 1
           if pending > 0 { continue }
+        case .refreshRejected, .refreshFailed:
+          // Every endpoint awaits the same token task.
+          failure = result
         case .failed:
           pending -= 1
           if pending > 0 { continue }
@@ -320,11 +377,17 @@ final class HomeAssistant {
         }
         group.cancelAll()
         for await other in group {
-          if case .connected(let loser) = other { loser.close() }
+          switch other {
+          case .connected(let loser): loser.close()
+          case .refreshRejected, .refreshFailed: failure = other
+          case .authRejected:
+            if case .failed = failure { failure = other }
+          case .failed, .timeout: break
+          }
         }
-        return sawAuthRejected ? .authRejected : .failed
+        return failure
       }
-      return sawAuthRejected ? .authRejected : .failed
+      return failure
     }
     if Task.isCancelled {
       if case .connected(let socket) = outcome { socket.close() }
@@ -335,8 +398,12 @@ final class HomeAssistant {
       return socket
     case .authRejected:
       throw HAAuthRejectedError()
+    case .refreshRejected:
+      throw HARefreshRejectedError()
+    case .refreshFailed(let error):
+      throw error
     case .failed, .timeout:
-      throw DoorbellCompanionError("Home Assistant WebSocket is unreachable")
+      throw HAWebSocketUnavailableError()
     }
   }
 
@@ -811,6 +878,11 @@ final class HomeAssistant {
   private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
     let request = formRequest(at: url, path: "auth/token", fields: fields)
     let (data, response) = try await session.data(for: request)
+    if fields["grant_type"] == "refresh_token", (response as? HTTPURLResponse)?.statusCode == 400,
+       let body = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
+       body["error"] as? String == "invalid_grant" {
+      throw HARefreshRejectedError()
+    }
     guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
           let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
       throw DoorbellCompanionError("Home Assistant sign-in failed")

@@ -377,7 +377,15 @@ object HomeAssistantAuth {
         return null
     }
 
-    fun getAccessToken(context: Context, forceRefresh: Boolean = false): String? {
+    class RefreshTokenRejected : Exception()
+
+    fun getAccessToken(context: Context, forceRefresh: Boolean = false): String? = try {
+        cameraAccessToken(context, forceRefresh)
+    } catch (_: RefreshTokenRejected) {
+        null
+    }
+
+    fun cameraAccessToken(context: Context, forceRefresh: Boolean = false): String? {
         if (!forceRefresh) {
             peekAccessToken(context)?.let { return it }
         }
@@ -413,6 +421,7 @@ object HomeAssistantAuth {
         }
         if (calls.isEmpty()) return null
         val result = AtomicReference<Pair<String, Long>?>(null)
+        val rejected = AtomicBoolean(false)
         val pending = AtomicInteger(calls.size)
         val done = CountDownLatch(1)
         val callback = object : Callback {
@@ -423,8 +432,12 @@ object HomeAssistantAuth {
             override fun onResponse(call: Call, response: Response) {
                 try {
                     response.use {
-                        if (!it.isSuccessful) return
+                        if (!it.isSuccessful && it.code != 400) return
                         val body = JSONObject(it.body?.string().orEmpty())
+                        if (!it.isSuccessful) {
+                            if (body.optString("error") == "invalid_grant") rejected.set(true)
+                            return
+                        }
                         val token = body.optString("access_token")
                         if (token.isBlank()) return
                         val expiresAt = System.currentTimeMillis() + body.optLong("expires_in", 1800L) * 1000L
@@ -440,7 +453,9 @@ object HomeAssistantAuth {
         return try {
             calls.forEach { it.enqueue(callback) }
             done.await(8, TimeUnit.SECONDS)
-            result.get().also { if (it == null) Log.w("DoorbellCompanion", "HA token refresh failed") }
+            val token = result.get()
+            if (token == null && rejected.get()) throw RefreshTokenRejected()
+            token.also { if (it == null) Log.w("DoorbellCompanion", "HA token refresh failed") }
         } finally {
             calls.forEach { it.cancel() }
         }

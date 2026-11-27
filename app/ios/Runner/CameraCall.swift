@@ -1,4 +1,5 @@
 import AVFoundation
+import Network
 import UIKit
 import WebRTC
 
@@ -19,7 +20,13 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   private var connection: RTCPeerConnection?
   private var socket: HASocket?
   private var connectionTask: Task<Void, Never>?
+  private var connectionTimeout: Task<Void, Never>?
+  private var disconnectTimeout: Task<Void, Never>?
+  private var retryTask: Task<Void, Never>?
   private var snapshotTask: Task<Void, Never>?
+  private var attempt = 0
+  private var automaticRetryUsed = false
+  private var iceConnected = false
   private var sessionID: String?
   private var localCandidates: [RTCIceCandidate] = []
   private var remoteCandidates: [RTCIceCandidate] = []
@@ -36,8 +43,8 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   private(set) var snapshot: UIImage?
   private(set) var status = "Connecting camera…"
   private(set) var canMute = false
+  private(set) var canRetry = false
   var didChange: (() -> Void)?
-  var didFail: ((Error) -> Void)?
 
   static func warmUp() {
     DispatchQueue.global(qos: .utility).async {
@@ -63,22 +70,85 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
 
   func start() {
     guard connectionTask == nil else { return }
+    let current = attempt
     connectionTask = Task { [weak self] in
       guard let self else { return }
       do {
-        try await self.connect()
+        try await self.connect(attempt: current)
       } catch {
-        guard !Task.isCancelled else { return }
-        self.status = "Could not connect to the camera"
+        guard !Task.isCancelled, self.attempt == current else { return }
         NSLog("Doorbell Companion camera: %@", error.localizedDescription)
-        self.didChange?()
-        self.didFail?(error)
+        // ICE drives teardown when an established peer loses media connectivity.
+        guard !self.iceConnected else { return }
+        let requiresSignIn = error is HARefreshRejectedError || error is HAAuthRejectedError
+        self.connectionFailed(requiresSignIn ? "Sign in to Home Assistant again" : error.localizedDescription,
+                              retryable: Self.isConnectionError(error), requiresSignIn: requiresSignIn)
       }
     }
   }
 
+  private static func isConnectionError(_ error: Error) -> Bool {
+    if error is HAWebSocketUnavailableError { return true }
+    if let failure = error as? HARefreshFailedError { return failure.retryable }
+    return isHomeAssistantTransportError(error)
+  }
+
+  private func connectionFailed(_ message: String, retryable: Bool, requiresSignIn: Bool = false) {
+    mark("camera_connection_failed")
+    resetConnection()
+    guard retryable, !automaticRetryUsed else {
+      showFailure(message, canRetry: !requiresSignIn)
+      return
+    }
+    automaticRetryUsed = true
+    status = "Reconnecting camera…"
+    retryTask = Task { [weak self] in
+      let monitor = NWPathMonitor()
+      monitor.start(queue: .global(qos: .utility))
+      defer { monitor.cancel() }
+      let deadline = ProcessInfo.processInfo.systemUptime + 15
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      while !Task.isCancelled {
+        if monitor.currentPath.status == .satisfied {
+          self?.reconnect()
+          return
+        }
+        if ProcessInfo.processInfo.systemUptime >= deadline {
+          self?.showFailure("Could not reach Home Assistant")
+          return
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+      }
+    }
+    didChange?()
+  }
+
+  private func showFailure(_ message: String, canRetry: Bool = true) {
+    retryTask = nil
+    status = message
+    self.canRetry = canRetry
+    didChange?()
+  }
+
+  func retry() {
+    guard canRetry else { return }
+    automaticRetryUsed = false
+    reconnect()
+  }
+
+  private func reconnect() {
+    retryTask = nil
+    canRetry = false
+    status = "Reconnecting camera…"
+    mark("camera_reconnect_start")
+    didChange?()
+    start()
+  }
+
   private func buildPeerAndOffer(iceServers serverData: [JSON],
-                                 dataChannel dataChannelLabel: String?) async throws -> (RTCPeerConnection, String) {
+                                 dataChannel dataChannelLabel: String?,
+                                 attempt current: Int) async throws -> (RTCPeerConnection, String) {
+    try requireAttempt(current)
     let configuration = RTCConfiguration()
     configuration.sdpSemantics = .unifiedPlan
     configuration.bundlePolicy = .maxBundle
@@ -118,16 +188,22 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     }
 
     let offer = try await connection.offer(for: constraints)
-    try Task.checkCancellation()
+    try requireAttempt(current)
     try await connection.setLocalDescription(offer)
-    try Task.checkCancellation()
+    try requireAttempt(current)
     mark("local_sdp_ready")
     return (connection, offer.sdp)
   }
 
-  private func connect() async throws {
+  private func requireAttempt(_ current: Int) throws {
     try Task.checkCancellation()
+    guard attempt == current else { throw CancellationError() }
+  }
+
+  private func connect(attempt current: Int) async throws {
+    try requireAttempt(current)
     let endpoints = home.endpoints
+    guard !endpoints.isEmpty else { throw DoorbellCompanionError("Sign in to Home Assistant first") }
     let tokenTask = Task { [home] in try await home.accessToken() }
     defer { tokenTask.cancel() }
 
@@ -156,14 +232,27 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     // Overlap PeerConnection + offer creation with WebSocket connect when ICE servers are cached.
     let cachedIce = home.cachedICEServers()
     let prebuiltOffer: Task<(RTCPeerConnection, String), Error>? = cachedIce.map { servers in
-      Task { try await self.buildPeerAndOffer(iceServers: servers, dataChannel: self.bell.dataChannel) }
+      Task {
+        let camera = self.home.selectedDoorbell(camera: self.bell.camera) ?? self.bell
+        return try await self.buildPeerAndOffer(iceServers: servers, dataChannel: camera.dataChannel, attempt: current)
+      }
     }
     defer { prebuiltOffer?.cancel() }
 
     let socket = try await home.firstAuthorizedSocket(endpoints: endpoints, tokenTask: tokenTask)
+    do { try requireAttempt(current) } catch {
+      socket.close()
+      throw error
+    }
     self.socket = socket
-    try Task.checkCancellation()
     mark("ha_auth_ok")
+
+    // Authentication and token requests have their own deadlines.
+    connectionTimeout = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 12_000_000_000)
+      guard !Task.isCancelled, let self, self.attempt == current, !self.iceConnected else { return }
+      self.connectionFailed("Camera connection timed out", retryable: true)
+    }
 
     let connection: RTCPeerConnection
     let offerSdp: String
@@ -178,13 +267,16 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       let config = try await socket.command("camera/webrtc/get_client_config", fields: [
         "entity_id": bell.camera,
       ]) as? JSON
+      try requireAttempt(current)
       let serverData = (config?["configuration"] as? JSON)?["iceServers"] as? [JSON] ?? []
       home.saveICEServers(serverData)
       let dataChannelLabel = config?["dataChannel"] as? String
       home.saveDataChannel(dataChannelLabel, camera: bell.camera)
-      (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData, dataChannel: dataChannelLabel)
+      (connection, offerSdp) = try await buildPeerAndOffer(iceServers: serverData, dataChannel: dataChannelLabel,
+                                                           attempt: current)
     }
 
+    try requireAttempt(current)
     let latestSdp = connection.localDescription?.sdp.isEmpty == false ? connection.localDescription!.sdp : offerSdp
     if latestSdp.contains("a=candidate:") {
       localCandidates.removeAll { latestSdp.contains($0.sdp) }
@@ -196,6 +288,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
 
     while !Task.isCancelled {
       let message = try await socket.receive()
+      try requireAttempt(current)
       let msgID = message["id"] as? Int
       if let configCommandID, msgID == configCommandID, message["type"] as? String == "result" {
         if let result = message["result"] as? JSON {
@@ -209,7 +302,7 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
       }
       guard msgID == offerID else { continue }
       if message["type"] as? String == "result" && message["success"] as? Bool == false {
-        throw DoorbellCompanionError("Home Assistant rejected the WebRTC offer")
+        try handleSignalingError(DoorbellCompanionError("Home Assistant rejected the WebRTC offer"))
       }
       guard let event = message["event"] as? JSON else { continue }
       switch event["type"] as? String {
@@ -218,14 +311,18 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         mark("ha_session")
         let candidates = localCandidates
         localCandidates.removeAll()
-        for candidate in candidates { try await sendCandidate(candidate) }
+        for candidate in candidates {
+          try requireAttempt(current)
+          try await sendCandidate(candidate)
+        }
       case "answer":
         guard let answer = event["answer"] as? String, !remoteDescriptionSet else { continue }
         acceptsAudio = Self.acceptsMicrophone(answer)
         try await connection.setRemoteDescription(RTCSessionDescription(type: .answer, sdp: answer))
-        try Task.checkCancellation()
+        try requireAttempt(current)
         remoteDescriptionSet = true
         for candidate in remoteCandidates { try await connection.add(candidate) }
+        try requireAttempt(current)
         remoteCandidates.removeAll()
         mark("remote_description_set")
         updateMicrophone()
@@ -235,14 +332,25 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
         let candidate = RTCIceCandidate(sdp: sdp,
                                         sdpMLineIndex: data["sdpMLineIndex"] as? Int32 ?? 0,
                                         sdpMid: data["sdpMid"] as? String ?? "0")
-        if remoteDescriptionSet { try await connection.add(candidate) }
-        else { remoteCandidates.append(candidate) }
+        if remoteDescriptionSet {
+          do { try await connection.add(candidate) } catch {
+            try requireAttempt(current)
+            try handleSignalingError(error)
+          }
+        } else {
+          remoteCandidates.append(candidate)
+        }
       case "error":
-        throw DoorbellCompanionError(event["message"] as? String ?? "Home Assistant WebRTC error")
+        try handleSignalingError(DoorbellCompanionError(event["message"] as? String ?? "Home Assistant WebRTC error"))
       default:
         break
       }
     }
+  }
+
+  private func handleSignalingError(_ error: Error) throws {
+    guard iceConnected else { throw error }
+    NSLog("Doorbell Companion camera: %@", error.localizedDescription)
   }
 
   private func sendCandidate(_ candidate: RTCIceCandidate) async throws {
@@ -295,17 +403,44 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   }
 
   func close() {
-    connectionTask?.cancel()
-    snapshotTask?.cancel()
+    mark("camera_closed")
+    retryTask?.cancel()
+    retryTask = nil
+    resetConnection()
     snapshot = nil
+    canRetry = false
+    didChange = nil
+  }
+
+  private func resetConnection() {
+    attempt += 1
+    connectionTask?.cancel()
+    connectionTask = nil
+    connectionTimeout?.cancel()
+    connectionTimeout = nil
+    disconnectTimeout?.cancel()
+    disconnectTimeout = nil
+    snapshotTask?.cancel()
+    snapshotTask = nil
     socket?.close()
     dataChannel?.close()
-    connection?.close()
     microphone?.isEnabled = false
+    let previous = connection
     connection = nil
+    previous?.close()
     socket = nil
-    didChange = nil
-    didFail = nil
+    sessionID = nil
+    localCandidates.removeAll()
+    remoteCandidates.removeAll()
+    remoteDescriptionSet = false
+    iceConnected = false
+    audioSender = nil
+    dataChannel = nil
+    microphone = nil
+    acceptsAudio = false
+    canMute = false
+    video = nil
+    firstFrameLogged = false
   }
 
   func renderedFirstFrame() {
@@ -313,7 +448,6 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
     firstFrameLogged = true
     snapshotTask?.cancel()
     snapshotTask = nil
-    snapshot = nil
     mark("first_frame")
   }
 
@@ -342,12 +476,25 @@ final class CameraCall: NSObject, RTCPeerConnectionDelegate {
   nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
     Task { @MainActor [weak self] in
       guard let self, self.connection === peerConnection else { return }
+      self.disconnectTimeout?.cancel()
+      self.disconnectTimeout = nil
       switch newState {
       case .connected, .completed:
+        self.iceConnected = true
+        self.connectionTimeout?.cancel()
+        self.connectionTimeout = nil
         self.status = "Live"
+        self.mark("ice_connected")
+      case .disconnected:
+        self.disconnectTimeout = Task { [weak self] in
+          try? await Task.sleep(nanoseconds: 2_000_000_000)
+          guard !Task.isCancelled, let self, self.connection === peerConnection else { return }
+          self.connectionFailed("Camera connection interrupted", retryable: true)
+        }
+        return
       case .failed:
-        self.status = "Camera connection failed"
-        self.didFail?(DoorbellCompanionError(self.status))
+        self.connectionFailed("Remote media connection failed (NAT/ICE)", retryable: true)
+        return
       default:
         return
       }
@@ -369,11 +516,12 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   private let call: CameraCall
   private let toggleMuteAction: () -> Void
   private let endCall: () -> Void
-  private let video = RTCMTLVideoView()
+  private var video: RTCMTLVideoView?
   private let snapshot = UIImageView()
   private let statusLabel = UILabel()
   private let statusDot = UIView()
   private let muteButton = CallControl(symbol: "mic.fill", title: "Mute", color: UIColor(white: 1, alpha: 0.22))
+  private let retryButton = UIButton(type: .system)
   private let topShade = GradientView(colors: [UIColor(white: 0, alpha: 0.7), .clear])
   private let bottomShade = GradientView(colors: [.clear, UIColor(white: 0, alpha: 0.75)])
   private var track: RTCVideoTrack?
@@ -395,14 +543,12 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
-    video.delegate = self
     snapshot.clipsToBounds = true
     applyContentMode()
-    for child in [video, snapshot, topShade, bottomShade] {
+    for child in [snapshot, topShade, bottomShade] {
       view.addSubview(child)
       child.translatesAutoresizingMaskIntoConstraints = false
     }
-    pin(video, to: view)
     pin(snapshot, to: view)
     view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggleContentMode)))
 
@@ -439,7 +585,11 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
       statusRow.topAnchor.constraint(equalTo: chip.topAnchor, constant: 6),
       statusRow.bottomAnchor.constraint(equalTo: chip.bottomAnchor, constant: -6),
     ])
-    let header = UIStackView(arrangedSubviews: [title, chip])
+    var retryStyle = UIButton.Configuration.filled()
+    retryStyle.title = "Retry"
+    retryButton.configuration = retryStyle
+    retryButton.addAction(UIAction { [weak self] _ in self?.call.retry() }, for: .touchUpInside)
+    let header = UIStackView(arrangedSubviews: [title, chip, retryButton])
     header.axis = .vertical
     header.alignment = .center
     header.spacing = 10
@@ -479,8 +629,12 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   }
 
   func detach() {
-    track?.remove(video)
+    if let video {
+      track?.remove(video)
+      video.removeFromSuperview()
+    }
     track = nil
+    video = nil
   }
 
   private func pin(_ child: UIView, to parent: UIView) {
@@ -498,7 +652,7 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
   }
 
   private func applyContentMode() {
-    video.videoContentMode = fillsScreen ? .scaleAspectFill : .scaleAspectFit
+    video?.videoContentMode = fillsScreen ? .scaleAspectFill : .scaleAspectFit
     snapshot.contentMode = fillsScreen ? .scaleAspectFill : .scaleAspectFit
   }
 
@@ -506,25 +660,36 @@ final class CameraCallViewController: UIViewController, RTCVideoViewDelegate {
     statusLabel.text = call.status
     live = call.status == "Live"
     statusDot.backgroundColor = live ? .systemGreen : .systemOrange
+    retryButton.isHidden = !call.canRetry
     muteButton.isHidden = !call.canMute
     muteButton.update(symbol: call.muted ? "mic.slash.fill" : "mic.fill",
                       title: call.muted ? "Unmute" : "Mute")
-    if !snapshot.isHidden {
-      snapshot.image = call.snapshot
-    }
     if track !== call.video {
-      track?.remove(video)
-      track = call.video
-      track?.add(video)
+      detach()
+      snapshot.isHidden = false
+      if let track = call.video {
+        // A new renderer reports its first video size even when the retry keeps the old resolution.
+        let video = RTCMTLVideoView()
+        self.video = video
+        self.track = track
+        video.delegate = self
+        view.insertSubview(video, belowSubview: snapshot)
+        video.translatesAutoresizingMaskIntoConstraints = false
+        pin(video, to: view)
+        applyContentMode()
+        track.add(video)
+      }
     }
+    snapshot.image = snapshot.isHidden ? nil : call.snapshot
   }
 
   nonisolated func videoView(_ videoView: RTCVideoRenderer, didChangeVideoSize size: CGSize) {
     guard size.width > 0, size.height > 0 else { return }
     Task { @MainActor [weak self] in
-      self?.snapshot.isHidden = true
-      self?.snapshot.image = nil
-      self?.call.renderedFirstFrame()
+      guard let self, self.video === videoView else { return }
+      self.snapshot.isHidden = true
+      self.snapshot.image = nil
+      self.call.renderedFirstFrame()
     }
   }
 }

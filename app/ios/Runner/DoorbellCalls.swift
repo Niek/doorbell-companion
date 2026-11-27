@@ -74,7 +74,10 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload,
                     for type: PKPushType, completion: @escaping () -> Void) {
     guard type == .voIP else { completion(); return }
-    let value = payload.dictionaryPayload
+    receiveIncomingCall(payload.dictionaryPayload, completion: completion)
+  }
+
+  func receiveIncomingCall(_ value: [AnyHashable: Any], completion: @escaping () -> Void) {
     let id = (value["call_id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID()
     let name = value["doorbell_name"] as? String ?? "Doorbell"
     let camera = value["camera_entity_id"] as? String
@@ -96,7 +99,6 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
     let available = active == nil && bell != nil && home.url != nil
     if available, let bell {
       let media = makeMedia(bell, workerTimeMs: workerTimeMs, eventTimeMs: eventTimeMs)
-      media.didFail = { [weak self] _ in self?.failCall(id) }
       active = Incoming(id: id, media: media, usesCallKit: true)
     }
     provider.reportNewIncomingCall(with: id, update: update) { [weak self] error in
@@ -198,14 +200,6 @@ final class DoorbellCalls: NSObject, @preconcurrency PKPushRegistryDelegate, @pr
   func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
     finish(action.callUUID)
     action.fulfill()
-  }
-
-  private func failCall(_ id: UUID) {
-    guard active?.id == id else { return }
-    // Keep the snapshot and error visible when the user is already in the app.
-    if active?.answered == true { return }
-    provider.reportCall(with: id, endedAt: Date(), reason: .failed)
-    finish(id)
   }
 
   func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {

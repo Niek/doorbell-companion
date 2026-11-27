@@ -7,6 +7,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import okhttp3.Call
 import okhttp3.Callback
@@ -166,6 +167,21 @@ class HomeAssistantRemote(
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val timing = CallTiming.current
+    private var connectionDeadline = Long.MAX_VALUE
+    private val connectionTimeout = Runnable {
+        schedule {
+            if (!iceConnected && SystemClock.uptimeMillis() >= connectionDeadline) {
+                reportFailure("Camera connection timed out", retryable = true)
+            }
+        }
+    }
+    private val mediaDisconnectTimeout = Runnable {
+        schedule {
+            if (iceState == PeerConnection.IceConnectionState.DISCONNECTED) {
+                reportFailure("Camera connection interrupted", retryable = true)
+            }
+        }
+    }
 
     private var ws: WebSocket? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -190,6 +206,10 @@ class HomeAssistantRemote(
     @Volatile private var latestSnapshot: Bitmap? = null
     @Volatile private var firstFrameDecoded = false
     @Volatile private var latestStatus: String = "Connecting to Home Assistant…"
+    @Volatile private var onFailure: (Failure) -> Unit = {}
+    @Volatile private var failure: Failure? = null
+    private var iceState = PeerConnection.IceConnectionState.NEW
+    private var iceConnected = false
     @Volatile private var answered = false
     @Volatile private var microphoneAllowed = false
     @Volatile private var micMuted = false
@@ -217,28 +237,42 @@ class HomeAssistantRemote(
         } catch (_: Exception) {}
     }
 
+    data class Failure(val message: String, val retryable: Boolean, val requiresSignIn: Boolean)
+
     private fun reportStatus(msg: String) {
+        if (failure != null) return
         latestStatus = msg
         status(msg)
+    }
+
+    // Called on the connection executor. A prewarmed session can fail before the view attaches.
+    private fun reportFailure(message: String, retryable: Boolean = false, requiresSignIn: Boolean = false) {
+        if (failure != null) return
+        val error = Failure(message, retryable, requiresSignIn)
+        failure = error
+        main.removeCallbacks(connectionTimeout)
+        main.removeCallbacks(mediaDisconnectTimeout)
+        onFailure(error)
     }
 
     fun attachListeners(
         videoListener: (VideoTrack) -> Unit,
         statusListener: (String) -> Unit,
+        failureListener: (Failure) -> Unit,
         micStateListener: (Boolean) -> Unit = {},
         snapshotListener: (Bitmap) -> Unit = {},
     ) {
         onVideo = videoListener
         status = statusListener
+        onFailure = failureListener
         onMicState = micStateListener
         onSnapshot = snapshotListener
         ringSnapshotListener = null
         statusListener(latestStatus)
-        if (!firstFrameDecoded) {
-            latestSnapshot?.let(snapshotListener)
-        }
+        latestSnapshot?.let(snapshotListener)
         currentVideoTrack?.let(videoListener)
         micStateListener(micAttached)
+        failure?.let(failureListener)
     }
 
     fun connect() {
@@ -264,34 +298,67 @@ class HomeAssistantRemote(
         // Wake Wi-Fi out of 802.11 DTIM power-save (100-200ms beacon sleep) immediately at t=0ms.
         acquireLowLatencyWifiLock()
 
+        val immediateToken = HomeAssistantAuth.peekAccessToken(context)
         // Start WebSocket connection(s) FIRST (~1ms, non-blocking) so TCP/TLS handshake overlaps peer setup.
         schedule {
             candidateEndpoints = endpoints
             needInitialIceConfig = !hasUsableIce
             openRacingWebSockets(endpoints)
+            if (immediateToken != null) {
+                armConnectionTimeout()
+                onTokenReady(immediateToken)
+            } else {
+                requestCameraToken(forceRefresh = false)
+            }
         }
         if (hasUsableIce) {
             startPeerSetup(parseIceServers(cachedIceJson))
         }
 
-        // Resolve token in parallel with TCP/TLS/WebSocket handshake, and kick off instant snapshot fetch.
-        val immediateToken = HomeAssistantAuth.peekAccessToken(context)
         if (immediateToken != null) {
             fetchSnapshotAsync(endpoints, immediateToken)
-            schedule { onTokenReady(immediateToken) }
-        } else {
-            HomeAssistantAuth.ioExecutor.execute {
-                val token = HomeAssistantAuth.getAccessToken(context)
-                if (token != null) fetchSnapshotAsync(endpoints, token)
-                schedule {
-                    if (token.isNullOrBlank()) {
-                        reportStatus("Reconnect Home Assistant account")
-                    } else {
+        }
+    }
+
+    private fun armConnectionTimeout() {
+        connectionDeadline = SystemClock.uptimeMillis() + 12_000
+        main.postAtTime(connectionTimeout, connectionDeadline)
+    }
+
+    private fun requestCameraToken(forceRefresh: Boolean) {
+        // The OAuth requests have a separate deadline. Let them finish before timing out the camera.
+        connectionDeadline = Long.MAX_VALUE
+        main.removeCallbacks(connectionTimeout)
+        val endpoints = candidateEndpoints
+        HomeAssistantAuth.ioExecutor.execute {
+            val token = try {
+                HomeAssistantAuth.cameraAccessToken(context, forceRefresh)
+            } catch (_: HomeAssistantAuth.RefreshTokenRejected) {
+                schedule { reportSignInRequired() }
+                return@execute
+            }
+            if (token != null) fetchSnapshotAsync(endpoints, token)
+            schedule {
+                when {
+                    !forceRefresh && racingSockets.isEmpty() ->
+                        reportFailure("Could not reach Home Assistant", retryable = true)
+                    token == null -> reportFailure("Could not refresh Home Assistant sign-in", retryable = true)
+                    forceRefresh -> {
+                        armConnectionTimeout()
+                        currentToken = token
+                        openRacingWebSockets(endpoints)
+                    }
+                    else -> {
+                        armConnectionTimeout()
                         onTokenReady(token)
                     }
                 }
             }
         }
+    }
+
+    private fun reportSignInRequired() {
+        reportFailure("Sign in to Home Assistant again", requiresSignIn = true)
     }
 
     /** Keeps cold WebRtcEngine initialization off `executor` so WebSocket auth is never blocked. */
@@ -307,7 +374,7 @@ class HomeAssistantRemote(
                     schedule { createPeerAndOffer(iceServers) }
                 } catch (e: Exception) {
                     Log.w("DoorbellCompanion", "WebRTC warmup failed: ${e.javaClass.simpleName}")
-                    reportStatus("Could not start WebRTC")
+                    schedule { reportFailure("Could not start WebRTC") }
                 }
             }
         }
@@ -377,19 +444,29 @@ class HomeAssistantRemote(
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                        schedule {
-                            racingSockets.remove(webSocket)
-                            authRequiredSockets.remove(webSocket)
-                            if (wsAuthed && webSocket !== ws) return@schedule
-                            Log.w("DoorbellCompanion", "HA WebSocket ($label) failed: ${t.javaClass.simpleName}: ${t.message}")
-                            if (!wsAuthed && racingSockets.isEmpty() && currentVideoTrack == null) {
-                                reportStatus("Could not reach Home Assistant")
-                            }
-                        }
+                        handleSocketLost(webSocket, "$label: ${t.javaClass.simpleName}")
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(1000, null)
+                        handleSocketLost(webSocket, "$label: closed ($code)")
                     }
                 }
             )
             racingSockets.add(socket)
+        }
+    }
+
+    private fun handleSocketLost(socket: WebSocket, detail: String) = schedule {
+        if (!racingSockets.remove(socket)) return@schedule
+        Log.w("DoorbellCompanion", "HA WebSocket lost ($detail)")
+        authRequiredSockets.remove(socket)
+        if (!wsAuthed && racingSockets.isEmpty()) {
+            if (connectionDeadline != Long.MAX_VALUE) {
+                reportFailure("Could not reach Home Assistant", retryable = true)
+            }
+        } else if (socket === ws && !remoteDescriptionSet) {
+            reportFailure("Lost connection to Home Assistant", retryable = true)
         }
     }
 
@@ -414,7 +491,7 @@ class HomeAssistantRemote(
     }
 
     private fun handleWsMessage(webSocket: WebSocket, label: String, text: String) {
-        if (wsAuthed && webSocket !== ws) {
+        if (webSocket !in racingSockets) {
             webSocket.cancel()
             return
         }
@@ -430,19 +507,9 @@ class HomeAssistantRemote(
                         retriedAuth = true
                         currentToken = null
                         cancelOtherSockets(null)
-                        HomeAssistantAuth.ioExecutor.execute {
-                            val refreshed = HomeAssistantAuth.getAccessToken(context, forceRefresh = true)
-                            schedule {
-                                if (refreshed != null) {
-                                    currentToken = refreshed
-                                    openRacingWebSockets(candidateEndpoints)
-                                } else {
-                                    reportStatus("Home Assistant login expired")
-                                }
-                            }
-                        }
+                        requestCameraToken(forceRefresh = true)
                     } else {
-                        reportStatus("Home Assistant login expired")
+                        reportSignInRequired()
                     }
                 }
                 "auth_ok" -> {
@@ -489,7 +556,7 @@ class HomeAssistantRemote(
                     } else if (id == offerMsgId && !msg.optBoolean("success", true)) {
                         val err = msg.optJSONObject("error")?.optString("message") ?: "WebRTC offer rejected"
                         Log.w("DoorbellCompanion", "HA offer failed: $err")
-                        reportStatus(err)
+                        if (!iceConnected) reportFailure(err)
                     }
                 }
                 "event" -> {
@@ -520,7 +587,7 @@ class HomeAssistantRemote(
                                     }
                                     override fun onSetFailure(error: String) {
                                         Log.w("DoorbellCompanion", "HA setRemoteDescription failed: $error")
-                                        reportStatus("Camera stream negotiation failed")
+                                        schedule { reportFailure("Camera stream negotiation failed") }
                                     }
                                 }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
                             }
@@ -543,7 +610,8 @@ class HomeAssistantRemote(
                         "error" -> {
                             val errMsg = ev.optString("message", "Camera stream error")
                             Log.w("DoorbellCompanion", "HA WebRTC event error: $errMsg")
-                            reportStatus(errMsg)
+                            // Once media is connected, ICE decides when the peer must be replaced.
+                            if (!iceConnected) reportFailure(errMsg)
                         }
                     }
                 }
@@ -568,12 +636,24 @@ class HomeAssistantRemote(
             val connection = WebRtcEngine.factory.createPeerConnection(rtcConfig, object : SimplePeerConnectionObserver() {
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                     Log.i("DoorbellCompanion", "HA ICE state: $state")
-                    if (state == PeerConnection.IceConnectionState.CONNECTED || state == PeerConnection.IceConnectionState.COMPLETED) {
-                        timing?.mark("ice_${state.name.lowercase()}")
-                        logSelectedCandidatePair()
-                    } else if (state == PeerConnection.IceConnectionState.FAILED) {
-                        timing?.mark("ice_failed")
-                        reportStatus("Remote media connection failed (NAT/ICE)")
+                    schedule {
+                        iceState = state
+                        main.removeCallbacks(mediaDisconnectTimeout)
+                        when (state) {
+                            PeerConnection.IceConnectionState.CONNECTED, PeerConnection.IceConnectionState.COMPLETED -> {
+                                iceConnected = true
+                                main.removeCallbacks(connectionTimeout)
+                                timing?.mark("ice_${state.name.lowercase()}")
+                                logSelectedCandidatePair()
+                            }
+                            PeerConnection.IceConnectionState.DISCONNECTED ->
+                                main.postDelayed(mediaDisconnectTimeout, 2_000)
+                            PeerConnection.IceConnectionState.FAILED -> {
+                                timing?.mark("ice_failed")
+                                reportFailure("Remote media connection failed (NAT/ICE)", retryable = true)
+                            }
+                            else -> Unit
+                        }
                     }
                 }
 
@@ -599,7 +679,6 @@ class HomeAssistantRemote(
                                     override fun onFrame(frame: VideoFrame) {
                                         if (first.compareAndSet(false, true)) {
                                             firstFrameDecoded = true
-                                            latestSnapshot = null
                                             if (!needsSnapshot()) cancelSnapshotCalls()
                                             timing?.mark("first_frame_decoded")
                                             schedule {
@@ -659,14 +738,18 @@ class HomeAssistantRemote(
                                 trySendOffer()
                             }
                         }
-                        override fun onSetFailure(error: String) { reportStatus("Could not prepare WebRTC offer") }
+                        override fun onSetFailure(error: String) {
+                            schedule { reportFailure("Could not prepare WebRTC offer") }
+                        }
                     }, offer)
                 }
-                override fun onCreateFailure(error: String) { reportStatus("Could not create WebRTC offer") }
+                override fun onCreateFailure(error: String) {
+                    schedule { reportFailure("Could not create WebRTC offer") }
+                }
             }, MediaConstraints())
         } catch (e: Exception) {
             Log.w("DoorbellCompanion", "HA PeerConnection setup failed: ${e.javaClass.simpleName}")
-            reportStatus("Could not start WebRTC")
+            reportFailure("Could not start WebRTC")
         }
     }
 
@@ -754,7 +837,6 @@ class HomeAssistantRemote(
         schedule { localAudio?.setEnabled(!muted) }
     }
 
-    fun isMicMuted(): Boolean = micMuted
     fun isMicAttached(): Boolean = micAttached
 
     private fun applyAnsweredAudioState() {
@@ -880,6 +962,8 @@ class HomeAssistantRemote(
     fun close() {
         if (closed) return
         closed = true
+        main.removeCallbacks(connectionTimeout)
+        main.removeCallbacks(mediaDisconnectTimeout)
         latestSnapshot = null
         ringSnapshotListener = null
         cancelSnapshotCalls()
