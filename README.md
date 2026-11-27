@@ -35,6 +35,7 @@ Based on Home Assistant Core [2026.11.3](https://github.com/home-assistant/core/
 | Home Assistant integration | Audio | Setup and notes |
 | --- | --- | --- |
 | [Reolink](https://www.home-assistant.io/integrations/reolink/) | Two-way (supported models) | Keep the default RTSP protocol. |
+| [Matter](https://www.home-assistant.io/integrations/matter/) | Two-way (supported models) | Requires Matter 1.5 and Matter Server 9.3.0+. Snapshots, WebRTC, and talkback work, but doorbell rings aren't auto-detected yet ([Core #175875](https://github.com/home-assistant/core/pull/175875)): rename the doorbell's `event.*` button entity to end in `_doorbell`, or pair a [separate button](#camera-and-a-separate-button). |
 | [UniFi Protect](https://www.home-assistant.io/integrations/unifiprotect/) | Listen only | Set up with a local user (not API key only), or rings won't be detected. Talkback tracked in go2rtc [#2712](https://github.com/AlexxIT/go2rtc/pull/2712) and [#2340](https://github.com/AlexxIT/go2rtc/pull/2340). |
 | [Ring](https://www.home-assistant.io/integrations/ring/) | Listen only / Two-way (beta) | Keep **Last recording** disabled. Two-way audio added in [Core #190763](https://github.com/home-assistant/core/pull/190763). |
 | [Google Nest](https://www.home-assistant.io/integrations/nest/) | Listen only | Newer WebRTC models (such as the battery doorbell) are untested and show a placeholder until video starts ([snapshots proposed](https://github.com/home-assistant/core/pull/194637)). |
