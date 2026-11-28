@@ -132,7 +132,6 @@ final class HomeAssistant {
     deviceRegistration = defaults.string(forKey: "registration")
     registeredPushToken = defaults.string(forKey: "registered_push_token")
     registrationServer = defaults.url(forKey: "registration_server")
-    LocalHomeAssistant.watch { [weak self] in self?.localTargets ?? [] }
   }
 
   nonisolated static func serverURL(_ raw: String) throws -> URL {
@@ -867,11 +866,6 @@ final class HomeAssistant {
     endpoint.scheme?.lowercased() == "http" && endpoint.absoluteString.lowercased() != url?.absoluteString.lowercased()
   }
 
-  private var localTargets: [(host: String, instanceID: String)] {
-    guard let instanceID else { return [] }
-    return endpoints.filter { needsVerification($0) }.compactMap { $0.host }.map { (host: $0, instanceID: instanceID) }
-  }
-
   private func saveInstanceID(at endpoint: URL, registration: String) async {
     guard let data = try? await request(at: endpoint, path: "api/webhook/\(registration)", json: ["type": "get_config"]),
           let config = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
@@ -998,11 +992,7 @@ final class HASocket {
 
   /// Confirms that this socket's connection reaches Home Assistant `instanceID` on the network it runs on.
   func verify(instanceID: String) async throws {
-    guard let local else { return }
-    let path = try await local.ready()
-    guard await LocalHomeAssistant.isVerified(path: path, host: local.host, instanceID: instanceID) else {
-      throw URLError(.cannotConnectToHost)
-    }
+    try await local?.verify(instanceID: instanceID)
   }
 
   func close() {
@@ -1086,65 +1076,15 @@ final class HASocket {
   }
 }
 
-/// Confirms that a plain-HTTP address is the signed-in Home Assistant before it receives credentials.
-/// Home Assistant's mDNS service record includes its instance ID, so a direct mDNS query to the address
-/// must return `uuid=<instance ID>`. Another device that happens to use the same address can't do that.
-/// A check counts for one network: the peer address, the phone's address, the gateways and the interface.
-/// Credential-bearing connections are opened first, and their own path has to match a verified network.
-@MainActor
+/// Confirms that a local plain-HTTP connection reaches the signed-in Home Assistant before it carries credentials.
+/// Home Assistant's mDNS service record includes its instance ID. Once a connection is open, a direct mDNS query
+/// goes to that connection's peer over the same interface, and the reply must contain `uuid=<instance ID>`.
+/// Every connection is checked on its own, so a result never carries over to another network.
 enum LocalHomeAssistant {
-  private static var verified: Set<String> = []
-  private static var monitor: NWPathMonitor?
-  private static var sawFirstPath = false
-
-  /// Clears checks when the network changes, then rechecks `targets` on the new network.
-  static func watch(targets: @escaping @MainActor () -> [(host: String, instanceID: String)]) {
-    guard monitor == nil else { return }
-    let monitor = NWPathMonitor()
-    monitor.pathUpdateHandler = { _ in
-      Task { @MainActor in
-        // The first update reports the network the app already uses, so earlier checks stay valid.
-        if sawFirstPath { verified.removeAll() }
-        sawFirstPath = true
-        for target in targets() {
-          if let key = await query(host: NWEndpoint.Host(target.host), interface: nil, instanceID: target.instanceID) {
-            verified.insert(key)
-          }
-        }
-      }
-    }
-    monitor.start(queue: .main)
-    self.monitor = monitor
-  }
-
-  /// Returns whether the peer of an open connection on `path` is Home Assistant `instanceID` on that same network.
   static func isVerified(path: NWPath, host: NWEndpoint.Host, instanceID: String) async -> Bool {
-    let peer = remoteHost(path) ?? host
-    let key = networkKey(path, peer: peer, instanceID: instanceID)
-    if verified.contains(key) { return true }
-    // Probe the connection's peer over the connection's interface. Its path must describe the same network.
-    guard await query(host: peer, interface: path.availableInterfaces.first, instanceID: instanceID) == key else {
-      return false
-    }
-    verified.insert(key)
-    return true
-  }
-
-  private nonisolated static func remoteHost(_ path: NWPath?) -> NWEndpoint.Host? {
-    if case .hostPort(let host, _)? = path?.remoteEndpoint { return host }
-    return nil
-  }
-
-  nonisolated static func networkKey(_ path: NWPath?, peer: NWEndpoint.Host, instanceID: String) -> String {
-    var phone = "-"
-    if case .hostPort(let host, _)? = path?.localEndpoint { phone = "\(host)" }
-    let gateways = (path?.gateways ?? []).map { "\($0)" }.sorted().joined(separator: ",")
-    return [instanceID, "\(peer)", phone, gateways, path?.availableInterfaces.first?.name ?? "-"].joined(separator: " ")
-  }
-
-  /// Returns the network key of the probe's path when `host` answers with `instanceID`.
-  private nonisolated static func query(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) async -> String? {
-    let probe = MDNSProbe(host: host, interface: interface, instanceID: instanceID)
+    var peer = host
+    if case .hostPort(let remote, _)? = path.remoteEndpoint { peer = remote }
+    let probe = MDNSProbe(host: peer, interface: path.availableInterfaces.first, instanceID: instanceID)
     // A cancelled race stops the probe at once, so the losing branch doesn't hold up the winner.
     return await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
@@ -1157,7 +1097,7 @@ enum LocalHomeAssistant {
 
   /// A legacy unicast PTR query for `_home-assistant._tcp.local`, which gets a direct reply.
   /// A fresh ID keeps a retry from being dropped as a duplicate.
-  nonisolated static func serviceQuery() -> Data {
+  static func serviceQuery() -> Data {
     let id = UInt16.random(in: 0...UInt16.max)
     var packet = Data([UInt8(id >> 8), UInt8(id & 0xff), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
     for label in ["_home-assistant", "_tcp", "local"] {
@@ -1173,24 +1113,22 @@ enum LocalHomeAssistant {
 /// All state changes run on `queue`.
 private final class MDNSProbe: @unchecked Sendable {
   private let connection: NWConnection
-  private let host: NWEndpoint.Host
-  private let instanceID: String
+  private let expected: Data
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
-  private var completion: ((String?) -> Void)?
+  private var completion: ((Bool) -> Void)?
   private var cancelled = false
 
   init(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) {
     let parameters = NWParameters.udp
     if let interface { parameters.requiredInterface = interface }
     connection = NWConnection(host: host, port: 5353, using: parameters)
-    self.host = host
-    self.instanceID = instanceID
+    expected = Data("uuid=\(instanceID)".utf8)
   }
 
-  func start(_ completion: @escaping (String?) -> Void) {
+  func start(_ completion: @escaping (Bool) -> Void) {
     queue.async { [self] in
       self.completion = completion
-      if cancelled { return finish(nil) }
+      if cancelled { return finish(false) }
       connection.stateUpdateHandler = { [self] state in
         switch state {
         case .ready:
@@ -1198,12 +1136,12 @@ private final class MDNSProbe: @unchecked Sendable {
           send()
           queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
         case .failed, .cancelled:
-          finish(nil)
+          finish(false)
         default:
           break
         }
       }
-      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(nil) }
+      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
       connection.start(queue: queue)
     }
   }
@@ -1211,7 +1149,7 @@ private final class MDNSProbe: @unchecked Sendable {
   func cancel() {
     queue.async { [self] in
       cancelled = true
-      finish(nil)
+      finish(false)
     }
   }
 
@@ -1222,24 +1160,22 @@ private final class MDNSProbe: @unchecked Sendable {
 
   private func receive() {
     connection.receiveMessage { [self] data, _, _, error in
-      if let data, data.range(of: Data("uuid=\(instanceID)".utf8)) != nil {
-        return finish(LocalHomeAssistant.networkKey(connection.currentPath, peer: host, instanceID: instanceID))
-      }
+      if let data, data.range(of: expected) != nil { return finish(true) }
       if error == nil, completion != nil { receive() }
     }
   }
 
-  private func finish(_ key: String?) {
+  private func finish(_ verified: Bool) {
     guard let completion else { return }
     self.completion = nil
     connection.stateUpdateHandler = nil
     connection.cancel()
-    completion(key)
+    completion(verified)
   }
 }
 
 /// One Network framework connection with async helpers. It gives up if it isn't ready within 8 seconds,
-/// like the URLSession requests. Waiting state runs on `queue`.
+/// like the URLSession requests. Errors surface as `URLError` so callers treat them like URLSession failures.
 final class LocalConnection: @unchecked Sendable {
   let host: NWEndpoint.Host
   private let connection: NWConnection
@@ -1262,8 +1198,22 @@ final class LocalConnection: @unchecked Sendable {
 
   func cancel() { connection.cancel() }
 
-  /// Waits until the connection is open and returns its path.
-  func ready() async throws -> NWPath {
+  /// Ends the connection after `seconds`, whatever state it is in.
+  func cancel(after seconds: Double) {
+    queue.asyncAfter(deadline: .now() + seconds) { [connection] in connection.cancel() }
+  }
+
+  /// Waits for the connection to open, checks its peer, and confirms the connection is still on the path
+  /// it opened on before anything with credentials is sent.
+  func verify(instanceID: String) async throws {
+    let path = try await ready()
+    guard await LocalHomeAssistant.isVerified(path: path, host: host, instanceID: instanceID),
+          case .ready = connection.state, connection.currentPath == path else {
+      throw URLError(.cannotConnectToHost)
+    }
+  }
+
+  private func ready() async throws -> NWPath {
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NWPath, Error>) in
         queue.async { [self] in
@@ -1298,23 +1248,25 @@ final class LocalConnection: @unchecked Sendable {
   func send(_ data: Data, context: NWConnection.ContentContext = .defaultMessage) async throws {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
-        if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+        if error != nil {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume()
+        }
       })
     }
   }
 
-  /// Reads the stream until the other side closes it.
-  func receiveAll() async throws -> Data {
-    var result = Data()
-    while true {
-      let (data, complete) = try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<(Data?, Bool), Error>) in
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
-          if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: (data, isComplete)) }
+  /// Returns the next bytes on the stream, and whether the other side has closed it.
+  func receive() async throws -> (Data?, Bool) {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data?, Bool), Error>) in
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+        if error != nil {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume(returning: (data, isComplete))
         }
       }
-      if let data { result.append(data) }
-      if complete { return result }
     }
   }
 
@@ -1324,7 +1276,11 @@ final class LocalConnection: @unchecked Sendable {
       let (data, context) = try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<(Data?, NWConnection.ContentContext?), Error>) in
         connection.receiveMessage { data, context, _, error in
-          if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: (data, context)) }
+          if error != nil {
+            continuation.resume(throwing: URLError(.networkConnectionLost))
+          } else {
+            continuation.resume(returning: (data, context))
+          }
         }
       }
       let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
@@ -1344,14 +1300,18 @@ enum LocalHTTP {
     guard let url = request.url, let host = url.host,
           let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) else { throw URLError(.badURL) }
     let local = LocalConnection(to: .hostPort(host: NWEndpoint.Host(host), port: port), using: .tcp)
+    // The whole exchange has the same 8-second limit as the URLSession requests.
+    local.cancel(after: 8)
     return try await withTaskCancellationHandler {
       defer { local.cancel() }
-      let path = try await local.ready()
-      guard await LocalHomeAssistant.isVerified(path: path, host: local.host, instanceID: instanceID) else {
-        throw URLError(.cannotConnectToHost)
-      }
+      try await local.verify(instanceID: instanceID)
       try await local.send(requestData(request, url: url, host: host))
-      let response = try await local.receiveAll()
+      var response = Data()
+      while !isComplete(response) {
+        let (data, closed) = try await local.receive()
+        if let data { response.append(data) }
+        if closed { break }
+      }
       return try parse(response, url: url)
     } onCancel: {
       local.cancel()
@@ -1364,29 +1324,42 @@ enum LocalHTTP {
     if target.isEmpty { target = "/" }
     if let query = components?.percentEncodedQuery { target += "?\(query)" }
     let body = request.httpBody ?? Data()
-    // HTTP/1.0 keeps the response unchunked and ends it by closing the connection.
+    // HTTP/1.0 keeps the response unchunked.
     var head = "\(request.httpMethod ?? "GET") \(target) HTTP/1.0\r\n"
     head += "Host: \(host)\(url.port.map { ":\($0)" } ?? "")\r\nContent-Length: \(body.count)\r\n"
     for (name, value) in request.allHTTPHeaderFields ?? [:] { head += "\(name): \(value)\r\n" }
     return Data((head + "\r\n").utf8) + body
   }
 
-  private static func parse(_ response: Data, url: URL) throws -> (Data, URLResponse) {
+  /// A response with Content-Length is complete once its body has arrived. Otherwise it ends when the connection closes.
+  private static func isComplete(_ response: Data) -> Bool {
     guard let end = response.range(of: Data("\r\n\r\n".utf8)),
-          let head = String(data: response[..<end.lowerBound], encoding: .utf8) else {
-      throw URLError(.badServerResponse)
+          let length = headers(response[..<end.lowerBound])["content-length"].flatMap({ Int($0) }) else {
+      return false
     }
-    let lines = head.components(separatedBy: "\r\n")
-    let status = lines[0].split(separator: " ")
+    return response.count - end.upperBound >= length
+  }
+
+  private static func headers(_ head: Data) -> [String: String] {
     var headers: [String: String] = [:]
-    for line in lines.dropFirst() {
+    for line in String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n").dropFirst() {
       guard let colon = line.firstIndex(of: ":") else { continue }
-      headers[String(line[..<colon])] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+      headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
     }
+    return headers
+  }
+
+  private static func parse(_ response: Data, url: URL) throws -> (Data, URLResponse) {
+    guard let end = response.range(of: Data("\r\n\r\n".utf8)) else { throw URLError(.badServerResponse) }
+    let head = response[..<end.lowerBound]
+    let status = String(decoding: head, as: UTF8.self).prefix { $0 != "\r" }.split(separator: " ")
+    var body = Data(response[end.upperBound...])
+    let fields = headers(head)
+    if let length = fields["content-length"].flatMap({ Int($0) }), body.count > length { body = body.prefix(length) }
     guard status.count >= 2, let code = Int(status[1]),
-          let httpResponse = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.0", headerFields: headers) else {
+          let httpResponse = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.0", headerFields: fields) else {
       throw URLError(.badServerResponse)
     }
-    return (Data(response[end.upperBound...]), httpResponse)
+    return (body, httpResponse)
   }
 }
