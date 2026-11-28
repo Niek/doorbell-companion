@@ -1181,6 +1181,8 @@ final class LocalConnection: @unchecked Sendable {
   private let connection: NWConnection
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-connection")
   private var readyWaiter: CheckedContinuation<NWPath, Error>?
+  /// Set on `queue` when `cancel(after:)` ends the connection, so reads report a timeout instead of a normal close.
+  private var expired = false
 
   init(to endpoint: NWEndpoint, using parameters: NWParameters) {
     switch endpoint {
@@ -1198,9 +1200,12 @@ final class LocalConnection: @unchecked Sendable {
 
   func cancel() { connection.cancel() }
 
-  /// Ends the connection after `seconds`, whatever state it is in.
+  /// Ends the connection after `seconds`, whatever state it is in. Later reads throw `URLError(.timedOut)`.
   func cancel(after seconds: Double) {
-    queue.asyncAfter(deadline: .now() + seconds) { [connection] in connection.cancel() }
+    queue.asyncAfter(deadline: .now() + seconds) { [self] in
+      expired = true
+      connection.cancel()
+    }
   }
 
   /// Waits for the connection to open, checks its peer, and confirms the connection is still on the path
@@ -1260,8 +1265,11 @@ final class LocalConnection: @unchecked Sendable {
   /// Returns the next bytes on the stream, and whether the other side has closed it.
   func receive() async throws -> (Data?, Bool) {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data?, Bool), Error>) in
-      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
-        if error != nil {
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [self] data, _, isComplete, error in
+        // A cancelled connection can report a normal close, so check the deadline first.
+        if expired {
+          continuation.resume(throwing: URLError(.timedOut))
+        } else if error != nil {
           continuation.resume(throwing: URLError(.networkConnectionLost))
         } else {
           continuation.resume(returning: (data, isComplete))
@@ -1312,6 +1320,7 @@ enum LocalHTTP {
         if let data { response.append(data) }
         if closed { break }
       }
+      try Task.checkCancellation()
       return try parse(response, url: url)
     } onCancel: {
       local.cancel()
@@ -1355,7 +1364,11 @@ enum LocalHTTP {
     let status = String(decoding: head, as: UTF8.self).prefix { $0 != "\r" }.split(separator: " ")
     var body = Data(response[end.upperBound...])
     let fields = headers(head)
-    if let length = fields["content-length"].flatMap({ Int($0) }), body.count > length { body = body.prefix(length) }
+    if let length = fields["content-length"].flatMap({ Int($0) }) {
+      // The connection closed before the whole body arrived.
+      guard body.count >= length else { throw URLError(.networkConnectionLost) }
+      body = body.prefix(length)
+    }
     guard status.count >= 2, let code = Int(status[1]),
           let httpResponse = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.0", headerFields: fields) else {
       throw URLError(.badServerResponse)
