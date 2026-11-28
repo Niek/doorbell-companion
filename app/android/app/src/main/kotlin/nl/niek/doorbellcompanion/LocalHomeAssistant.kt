@@ -110,25 +110,27 @@ object LocalHomeAssistant {
             system.createSocket(address, port, localAddress, localPort)
     }
 
-    private fun query(network: Network, address: InetAddress, expected: ByteArray): Boolean = DatagramSocket().use { socket ->
+    /** Queries twice, the second time from a new socket: after a miss, a retry on the same socket rarely gets an answer. */
+    private fun query(network: Network, address: InetAddress, expected: ByteArray): Boolean =
+        (1..2).any { queryOnce(network, address, expected) }
+
+    private fun queryOnce(network: Network, address: InetAddress, expected: ByteArray): Boolean = DatagramSocket().use { socket ->
         network.bindSocket(socket)
         socket.connect(address, 5353)
         socket.soTimeout = 400
+        // A legacy unicast query gets a direct reply. A fresh ID keeps a retry from being dropped as a duplicate.
+        val id = Random.nextInt(0x10000)
+        val packet = byteArrayOf((id shr 8).toByte(), id.toByte(), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) +
+            serviceName + byteArrayOf(0, 12, 0, 1) // PTR, IN
+        socket.send(DatagramPacket(packet, packet.size))
         val buffer = ByteArray(9000)
-        repeat(2) {
-            // A legacy unicast query gets a direct reply. A fresh ID keeps a retry from being dropped as a duplicate.
-            val id = Random.nextInt(0x10000)
-            val packet = byteArrayOf((id shr 8).toByte(), id.toByte(), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) +
-                serviceName + byteArrayOf(0, 12, 0, 1) // PTR, IN
-            socket.send(DatagramPacket(packet, packet.size))
-            try {
-                while (true) {
-                    val reply = DatagramPacket(buffer, buffer.size)
-                    socket.receive(reply)
-                    if (buffer.contains(reply.length, expected)) return true
-                }
-            } catch (_: SocketTimeoutException) {
+        try {
+            while (true) {
+                val reply = DatagramPacket(buffer, buffer.size)
+                socket.receive(reply)
+                if (buffer.contains(reply.length, expected)) return true
             }
+        } catch (_: SocketTimeoutException) {
         }
         false
     }
