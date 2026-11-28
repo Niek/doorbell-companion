@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Security
 
 typealias JSON = [String: Any]
@@ -99,6 +100,7 @@ final class HomeAssistant {
   private(set) var doorbells: [Doorbell]
   private(set) var localURL: URL?
   private(set) var externalURL: URL?
+  private var instanceID: String?
   private var deviceRegistration: String?
   private var registeredPushToken: String?
   private var registrationServer: URL?
@@ -126,6 +128,7 @@ final class HomeAssistant {
     } ?? []
     localURL = defaults.url(forKey: "local_url")
     externalURL = defaults.url(forKey: "external_url")
+    instanceID = defaults.string(forKey: "instance_id")
     deviceRegistration = defaults.string(forKey: "registration")
     registeredPushToken = defaults.string(forKey: "registered_push_token")
     registrationServer = defaults.url(forKey: "registration_server")
@@ -198,8 +201,10 @@ final class HomeAssistant {
     if credentials?.url != url {
       localURL = nil
       externalURL = nil
+      instanceID = nil
       defaults.removeObject(forKey: "local_url")
       defaults.removeObject(forKey: "external_url")
+      defaults.removeObject(forKey: "instance_id")
       defaults.removeObject(forKey: "ice_servers")
       defaults.removeObject(forKey: "ice_servers_time")
     }
@@ -229,6 +234,7 @@ final class HomeAssistant {
         for endpoint in candidates {
           group.addTask { @MainActor in
             do {
+              try await self.verifyLocalEndpoint(endpoint)
               let response = try await self.tokenResponse(url: endpoint, fields: fields)
               guard let access = response["access_token"] as? String, !access.isEmpty else {
                 throw DoorbellCompanionError("Home Assistant did not return an access token")
@@ -279,6 +285,7 @@ final class HomeAssistant {
       guard try await socket.receive()["type"] as? String == "auth_required" else {
         throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
       }
+      try await verifyLocalEndpoint(endpoint)
       let access = try await token()
       try Task.checkCancellation()
       try await socket.send(["type": "auth", "access_token": access])
@@ -587,7 +594,7 @@ final class HomeAssistant {
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
     let subscriptionState = try encoder.encode(enabled)
-    if !force, deviceRegistration != nil, registeredPushToken == pushToken,
+    if !force, deviceRegistration != nil, registeredPushToken == pushToken, instanceID != nil,
        defaults.data(forKey: syncKey) == subscriptionState {
       return
     }
@@ -627,6 +634,9 @@ final class HomeAssistant {
     }
     registeredPushToken = pushToken
     defaults.set(pushToken, forKey: "registered_push_token")
+    if force || instanceID == nil, let registration = deviceRegistration {
+      await saveInstanceID(at: endpoint, registration: registration)
+    }
 
     try await syncSharedAutomation(at: endpoint, token: token, refreshTriggers: force)
     guard let registration = deviceRegistration else { throw DoorbellCompanionError("Missing phone registration") }
@@ -731,10 +741,11 @@ final class HomeAssistant {
     doorbells = []
     localURL = nil
     externalURL = nil
+    instanceID = nil
     deviceRegistration = nil
     registeredPushToken = nil
     registrationServer = nil
-    for key in ["doorbells", "local_url", "external_url", "ice_servers", "ice_servers_time",
+    for key in ["doorbells", "local_url", "external_url", "instance_id", "ice_servers", "ice_servers_time",
                 "synced_doorbell_subscription", "registration", "registered_push_token",
                 "registration_server"] {
       defaults.removeObject(forKey: key)
@@ -791,6 +802,7 @@ final class HomeAssistant {
   private func revokeSession(at endpoints: [URL], token: String) async -> Bool {
     for endpoint in endpoints {
       do {
+        try await verifyLocalEndpoint(endpoint)
         let request = formRequest(at: endpoint, path: "auth/revoke", fields: ["token": token])
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode
@@ -839,12 +851,31 @@ final class HomeAssistant {
     try await request(at: endpoint, path: "api/camera_proxy/\(camera)", token: token)
   }
 
+  /// Plain-HTTP addresses other than the sign-in URL get credentials only after they confirm this instance's ID.
+  private func verifyLocalEndpoint(_ endpoint: URL) async throws {
+    guard endpoint.scheme?.lowercased() == "http",
+          endpoint.absoluteString.lowercased() != url?.absoluteString.lowercased() else { return }
+    guard let instanceID, let host = endpoint.host,
+          await LocalHomeAssistant.isVerified(host: host, instanceID: instanceID) else {
+      throw URLError(.cannotConnectToHost)
+    }
+  }
+
+  private func saveInstanceID(at endpoint: URL, registration: String) async {
+    guard let data = try? await request(at: endpoint, path: "api/webhook/\(registration)", json: ["type": "get_config"]),
+          let config = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
+          let id = config["instance_id"] as? String, !id.isEmpty else { return }
+    instanceID = id
+    defaults.set(id, forKey: "instance_id")
+  }
+
   private func saveDoorbells() {
     defaults.set(try? JSONEncoder().encode(doorbells), forKey: "doorbells")
   }
 
   private func request(at url: URL, path: String, token: String? = nil, json: JSON? = nil,
                        method: String? = nil, allowMissing: Bool = false) async throws -> Data {
+    try await verifyLocalEndpoint(url)
     var request = URLRequest(url: url.appendingPathComponent(path), timeoutInterval: 8)
     request.httpMethod = method ?? (json == nil ? "GET" : "POST")
     if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -995,5 +1026,69 @@ final class HASocket {
     message["id"] = id
     try await send(message)
     return id
+  }
+}
+
+/// Confirms that a plain-HTTP address is the signed-in Home Assistant before it receives credentials.
+/// Home Assistant's mDNS service record includes its instance ID, so a direct mDNS query to the address
+/// must return `uuid=<instance ID>`. Another device that happens to use the same address can't do that.
+@MainActor
+enum LocalHomeAssistant {
+  private static var verifiedAt: [String: Date] = [:]
+
+  static func isVerified(host: String, instanceID: String) async -> Bool {
+    let key = "\(host)/\(instanceID)"
+    if let date = verifiedAt[key], Date().timeIntervalSince(date) < 30 { return true }
+    let verified = await query(host: host, expected: Data("uuid=\(instanceID)".utf8))
+    if verified { verifiedAt[key] = Date() }
+    return verified
+  }
+
+  private nonisolated static func query(host: String, expected: Data) async -> Bool {
+    await withCheckedContinuation { continuation in
+      let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
+      let connection = NWConnection(host: NWEndpoint.Host(host), port: 5353, using: .udp)
+      var finished = false
+      func finish(_ verified: Bool) {
+        guard !finished else { return }
+        finished = true
+        connection.cancel()
+        continuation.resume(returning: verified)
+      }
+      func receive() {
+        connection.receiveMessage { data, _, _, error in
+          if let data, data.range(of: expected) != nil { return finish(true) }
+          if error == nil { receive() }
+        }
+      }
+      func send() { connection.send(content: serviceQuery(), completion: .idempotent) }
+      connection.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          receive()
+          send()
+          queue.asyncAfter(deadline: .now() + 0.4) { send() }
+        case .failed, .cancelled:
+          finish(false)
+        default:
+          break
+        }
+      }
+      queue.asyncAfter(deadline: .now() + 0.8) { finish(false) }
+      connection.start(queue: queue)
+    }
+  }
+
+  /// A legacy unicast PTR query for `_home-assistant._tcp.local`, which gets a direct reply.
+  /// A fresh ID keeps a retry from being dropped as a duplicate.
+  private nonisolated static func serviceQuery() -> Data {
+    let id = UInt16.random(in: 0...UInt16.max)
+    var packet = Data([UInt8(id >> 8), UInt8(id & 0xff), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+    for label in ["_home-assistant", "_tcp", "local"] {
+      packet.append(UInt8(label.utf8.count))
+      packet.append(contentsOf: label.utf8)
+    }
+    packet.append(contentsOf: [0, 0, 12, 0, 1])
+    return packet
   }
 }

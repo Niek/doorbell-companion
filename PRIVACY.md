@@ -8,7 +8,7 @@ Doorbell Companion connects your phone to your Home Assistant installation so yo
 
 You sign in on your Home Assistant server. Doorbell Companion stores the connection details, session tokens, doorbell configuration, and preferences on your phone so it can reconnect. It registers your phone with Home Assistant for notifications and configures the doorbell automation there. The push relay does not receive your Home Assistant password or session tokens.
 
-Your phone retrieves camera images and exchanges call audio and video with your Home Assistant setup. The app uses the microphone for talkback when you enable it. The hosted push relay does not receive camera images, video, or microphone audio, and Doorbell Companion does not record calls. Use HTTPS for a Home Assistant server you access over the internet. The app also supports local HTTP connections, which are unencrypted.
+Your phone retrieves camera images and exchanges call audio and video with your Home Assistant setup. The app uses the microphone for talkback when you enable it. The hosted push relay does not receive camera images, video, or microphone audio, and Doorbell Companion does not record calls. Use HTTPS for a Home Assistant server you access over the internet. The app also supports local HTTP connections, which are unencrypted. Before it sends credentials to a local HTTP address it found automatically, the app checks over mDNS that the address is your Home Assistant.
 
 ## Push notifications
 
