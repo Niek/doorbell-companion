@@ -1109,19 +1109,20 @@ enum LocalHomeAssistant {
   }
 }
 
-/// Sends the instance-ID query to one address, retries once, and gives up after 0.8 seconds or when cancelled.
-/// All state changes run on `queue`.
+/// Sends the instance-ID query to one address, retries once on a new socket, and gives up after 0.8 seconds
+/// or when cancelled. All state changes run on `queue`.
 private final class MDNSProbe: @unchecked Sendable {
-  private let connection: NWConnection
+  private let host: NWEndpoint.Host
+  private let interface: NWInterface?
   private let expected: Data
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
+  private var connections: [NWConnection] = []
   private var completion: ((Bool) -> Void)?
   private var cancelled = false
 
   init(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) {
-    let parameters = NWParameters.udp
-    if let interface { parameters.requiredInterface = interface }
-    connection = NWConnection(host: host, port: 5353, using: parameters)
+    self.host = host
+    self.interface = interface
     expected = Data("uuid=\(instanceID)".utf8)
   }
 
@@ -1129,20 +1130,10 @@ private final class MDNSProbe: @unchecked Sendable {
     queue.async { [self] in
       self.completion = completion
       if cancelled { return finish(false) }
-      connection.stateUpdateHandler = { [self] state in
-        switch state {
-        case .ready:
-          receive()
-          send()
-          queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
-        case .failed, .cancelled:
-          finish(false)
-        default:
-          break
-        }
-      }
+      attempt()
+      // After a miss, a retry on the same socket rarely gets an answer, so the retry opens a new one.
+      queue.asyncAfter(deadline: .now() + 0.4) { [self] in attempt() }
       queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
-      connection.start(queue: queue)
     }
   }
 
@@ -1153,23 +1144,36 @@ private final class MDNSProbe: @unchecked Sendable {
     }
   }
 
-  private func send() {
+  /// Opens a UDP socket on the probe's interface and sends one query once it is ready.
+  private func attempt() {
     guard completion != nil else { return }
-    connection.send(content: LocalHomeAssistant.serviceQuery(), completion: .idempotent)
+    let parameters = NWParameters.udp
+    if let interface { parameters.requiredInterface = interface }
+    let connection = NWConnection(host: host, port: 5353, using: parameters)
+    connections.append(connection)
+    connection.stateUpdateHandler = { [self] state in
+      guard case .ready = state, completion != nil else { return }
+      receive(on: connection)
+      connection.send(content: LocalHomeAssistant.serviceQuery(), completion: .idempotent)
+    }
+    connection.start(queue: queue)
   }
 
-  private func receive() {
+  private func receive(on connection: NWConnection) {
     connection.receiveMessage { [self] data, _, _, error in
       if let data, data.range(of: expected) != nil { return finish(true) }
-      if error == nil, completion != nil { receive() }
+      if error == nil, completion != nil { receive(on: connection) }
     }
   }
 
   private func finish(_ verified: Bool) {
     guard let completion else { return }
     self.completion = nil
-    connection.stateUpdateHandler = nil
-    connection.cancel()
+    for connection in connections {
+      connection.stateUpdateHandler = nil
+      connection.cancel()
+    }
+    connections.removeAll()
     completion(verified)
   }
 }
