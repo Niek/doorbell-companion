@@ -992,7 +992,8 @@ final class HASocket {
 
   /// Confirms that this socket's connection reaches Home Assistant `instanceID` on the network it runs on.
   func verify(instanceID: String) async throws {
-    try await local?.verify(instanceID: instanceID)
+    guard let local else { return }
+    try await withTimeout(8) { try await local.verify(instanceID: instanceID) }
   }
 
   func close() {
@@ -1028,9 +1029,8 @@ final class HASocket {
         throw DoorbellCompanionError("Invalid Home Assistant WebSocket response")
       }
       return result
-    } onCancel: { [task, local] in
+    } onCancel: { [task] in
       task?.cancel(with: .goingAway, reason: nil)
-      local?.cancel()
     }
   }
 
@@ -1076,28 +1076,58 @@ final class HASocket {
   }
 }
 
+/// Runs `body`, or cancels it and throws `URLError(.timedOut)` after `seconds`.
+func withTimeout<T: Sendable>(_ seconds: Double, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+  try await withThrowingTaskGroup(of: T.self) { group in
+    group.addTask(operation: body)
+    group.addTask {
+      try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+      throw URLError(.timedOut)
+    }
+    defer { group.cancelAll() }
+    return try await group.next()!
+  }
+}
+
 /// Confirms that a local plain-HTTP connection reaches the signed-in Home Assistant before it carries credentials.
 /// Home Assistant's mDNS service record includes its instance ID. Once a connection is open, a direct mDNS query
 /// goes to that connection's peer over the same interface, and the reply must contain `uuid=<instance ID>`.
 /// Every connection is checked on its own, so a result never carries over to another network.
 enum LocalHomeAssistant {
+  /// Queries at once and again at 0.4 seconds on a new socket, since a retry on the same socket rarely gets an
+  /// answer after a miss, and gives up at 0.8 seconds.
   static func isVerified(path: NWPath, host: NWEndpoint.Host, instanceID: String) async -> Bool {
-    var peer = host
-    if case .hostPort(let remote, _)? = path.remoteEndpoint { peer = remote }
-    let probe = MDNSProbe(host: peer, interface: path.availableInterfaces.first, instanceID: instanceID)
-    // A cancelled race stops the probe at once, so the losing branch doesn't hold up the winner.
-    return await withTaskCancellationHandler {
-      await withCheckedContinuation { continuation in
-        probe.start { continuation.resume(returning: $0) }
+    var remote: NWEndpoint.Host?
+    if case .hostPort(let address, _)? = path.remoteEndpoint { remote = address }
+    let peer = remote ?? host
+    let interface = path.availableInterfaces.first
+    let expected = Data("uuid=\(instanceID)".utf8)
+    let found = try? await withTimeout(0.8) {
+      await withTaskGroup(of: Bool.self) { group in
+        for delay: UInt64 in [0, 400_000_000] {
+          group.addTask {
+            try? await Task.sleep(nanoseconds: delay)
+            return await Self.query(peer, interface: interface, expected: expected)
+          }
+        }
+        for await found in group where found {
+          group.cancelAll()
+          return true
+        }
+        return false
       }
-    } onCancel: {
-      probe.cancel()
     }
+    return found == true
   }
 
-  /// A legacy unicast PTR query for `_home-assistant._tcp.local`, which gets a direct reply.
-  /// A fresh ID keeps a retry from being dropped as a duplicate.
-  static func serviceQuery() -> Data {
+  /// Sends a legacy unicast PTR query for `_home-assistant._tcp.local` from a new UDP socket, which gets a direct
+  /// reply. A fresh query ID keeps a retry from being dropped as a duplicate.
+  private static func query(_ host: NWEndpoint.Host, interface: NWInterface?, expected: Data) async -> Bool {
+    guard !Task.isCancelled else { return false }
+    let parameters = NWParameters.udp
+    if let interface { parameters.requiredInterface = interface }
+    let socket = LocalConnection(to: .hostPort(host: host, port: 5353), using: parameters)
+    defer { socket.cancel() }
     let id = UInt16.random(in: 0...UInt16.max)
     var packet = Data([UInt8(id >> 8), UInt8(id & 0xff), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
     for label in ["_home-assistant", "_tcp", "local"] {
@@ -1105,88 +1135,25 @@ enum LocalHomeAssistant {
       packet.append(contentsOf: label.utf8)
     }
     packet.append(contentsOf: [0, 0, 12, 0, 1])
-    return packet
+    do {
+      _ = try await socket.ready()
+      try await socket.send(packet)
+      while true {
+        if let data = try await socket.receiveMessage().0, data.range(of: expected) != nil { return true }
+      }
+    } catch {
+      return false
+    }
   }
 }
 
-/// Sends the instance-ID query to one address, retries once on a new socket, and gives up after 0.8 seconds
-/// or when cancelled. All state changes run on `queue`.
-private final class MDNSProbe: @unchecked Sendable {
-  private let host: NWEndpoint.Host
-  private let interface: NWInterface?
-  private let expected: Data
-  private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
-  private var connections: [NWConnection] = []
-  private var completion: ((Bool) -> Void)?
-  private var cancelled = false
-
-  init(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) {
-    self.host = host
-    self.interface = interface
-    expected = Data("uuid=\(instanceID)".utf8)
-  }
-
-  func start(_ completion: @escaping (Bool) -> Void) {
-    queue.async { [self] in
-      self.completion = completion
-      if cancelled { return finish(false) }
-      attempt()
-      // After a miss, a retry on the same socket rarely gets an answer, so the retry opens a new one.
-      queue.asyncAfter(deadline: .now() + 0.4) { [self] in attempt() }
-      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
-    }
-  }
-
-  func cancel() {
-    queue.async { [self] in
-      cancelled = true
-      finish(false)
-    }
-  }
-
-  /// Opens a UDP socket on the probe's interface and sends one query once it is ready.
-  private func attempt() {
-    guard completion != nil else { return }
-    let parameters = NWParameters.udp
-    if let interface { parameters.requiredInterface = interface }
-    let connection = NWConnection(host: host, port: 5353, using: parameters)
-    connections.append(connection)
-    connection.stateUpdateHandler = { [self] state in
-      guard case .ready = state, completion != nil else { return }
-      receive(on: connection)
-      connection.send(content: LocalHomeAssistant.serviceQuery(), completion: .idempotent)
-    }
-    connection.start(queue: queue)
-  }
-
-  private func receive(on connection: NWConnection) {
-    connection.receiveMessage { [self] data, _, _, error in
-      if let data, data.range(of: expected) != nil { return finish(true) }
-      if error == nil, completion != nil { receive(on: connection) }
-    }
-  }
-
-  private func finish(_ verified: Bool) {
-    guard let completion else { return }
-    self.completion = nil
-    for connection in connections {
-      connection.stateUpdateHandler = nil
-      connection.cancel()
-    }
-    connections.removeAll()
-    completion(verified)
-  }
-}
-
-/// One Network framework connection with async helpers. It gives up if it isn't ready within 8 seconds,
-/// like the URLSession requests. Errors surface as `URLError` so callers treat them like URLSession failures.
+/// One Network framework connection with async helpers. Cancelling the calling task cancels the connection,
+/// and errors surface as `URLError` so callers treat them like URLSession failures.
 final class LocalConnection: @unchecked Sendable {
   let host: NWEndpoint.Host
   private let connection: NWConnection
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-connection")
   private var readyWaiter: CheckedContinuation<NWPath, Error>?
-  /// Set on `queue` when `cancel(after:)` ends the connection, so reads report a timeout instead of a normal close.
-  private var expired = false
 
   init(to endpoint: NWEndpoint, using parameters: NWParameters) {
     switch endpoint {
@@ -1196,21 +1163,9 @@ final class LocalConnection: @unchecked Sendable {
     }
     connection = NWConnection(to: endpoint, using: parameters)
     connection.start(queue: queue)
-    queue.asyncAfter(deadline: .now() + 8) { [connection] in
-      if case .ready = connection.state { return }
-      connection.cancel()
-    }
   }
 
   func cancel() { connection.cancel() }
-
-  /// Ends the connection after `seconds`, whatever state it is in. Later reads throw `URLError(.timedOut)`.
-  func cancel(after seconds: Double) {
-    queue.asyncAfter(deadline: .now() + seconds) { [self] in
-      expired = true
-      connection.cancel()
-    }
-  }
 
   /// Waits for the connection to open, checks its peer, and confirms the connection is still on the path
   /// it opened on before anything with credentials is sent.
@@ -1222,17 +1177,13 @@ final class LocalConnection: @unchecked Sendable {
     }
   }
 
-  private func ready() async throws -> NWPath {
-    try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NWPath, Error>) in
-        queue.async { [self] in
-          readyWaiter = continuation
-          stateChanged(connection.state)
-          connection.stateUpdateHandler = { [self] in stateChanged($0) }
-        }
+  func ready() async throws -> NWPath {
+    try await perform { continuation in
+      queue.async { [self] in
+        readyWaiter = continuation
+        stateChanged(connection.state)
+        connection.stateUpdateHandler = { [self] in stateChanged($0) }
       }
-    } onCancel: { [connection] in
-      connection.cancel()
     }
   }
 
@@ -1255,25 +1206,18 @@ final class LocalConnection: @unchecked Sendable {
   }
 
   func send(_ data: Data, context: NWConnection.ContentContext = .defaultMessage) async throws {
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+    try await perform { (continuation: CheckedContinuation<Void, Error>) in
       connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
-        if error != nil {
-          continuation.resume(throwing: URLError(.networkConnectionLost))
-        } else {
-          continuation.resume()
-        }
+        if error != nil { continuation.resume(throwing: URLError(.networkConnectionLost)) } else { continuation.resume() }
       })
     }
   }
 
   /// Returns the next bytes on the stream, and whether the other side has closed it.
   func receive() async throws -> (Data?, Bool) {
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data?, Bool), Error>) in
-      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [self] data, _, isComplete, error in
-        // A cancelled connection can report a normal close, so check the deadline first.
-        if expired {
-          continuation.resume(throwing: URLError(.timedOut))
-        } else if error != nil {
+    try await perform { continuation in
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+        if error != nil {
           continuation.resume(throwing: URLError(.networkConnectionLost))
         } else {
           continuation.resume(returning: (data, isComplete))
@@ -1282,19 +1226,23 @@ final class LocalConnection: @unchecked Sendable {
     }
   }
 
+  /// Returns the next datagram or WebSocket message.
+  func receiveMessage() async throws -> (Data?, NWConnection.ContentContext?) {
+    try await perform { continuation in
+      connection.receiveMessage { data, context, _, error in
+        if error != nil {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume(returning: (data, context))
+        }
+      }
+    }
+  }
+
   /// Returns the next text or binary WebSocket message.
   func receiveWebSocketMessage() async throws -> Data {
     while true {
-      let (data, context) = try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<(Data?, NWConnection.ContentContext?), Error>) in
-        connection.receiveMessage { data, context, _, error in
-          if error != nil {
-            continuation.resume(throwing: URLError(.networkConnectionLost))
-          } else {
-            continuation.resume(returning: (data, context))
-          }
-        }
-      }
+      let (data, context) = try await receiveMessage()
       let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
       switch metadata?.opcode {
       case .text?, .binary?: return data ?? Data()
@@ -1303,32 +1251,39 @@ final class LocalConnection: @unchecked Sendable {
       }
     }
   }
+
+  /// Waits for one connection callback. Cancelling the task cancels the connection, which ends the callback.
+  private func perform<T>(_ start: (CheckedContinuation<T, Error>) -> Void) async throws -> T {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation(start)
+    } onCancel: { [connection] in
+      connection.cancel()
+    }
+  }
 }
 
 /// Sends one HTTP/1.0 request to a local Home Assistant address. The connection opens first, its peer and
 /// network are verified, and only then does the request, with its credentials, go out on that connection.
+/// The whole exchange has the same 8-second limit as the URLSession requests.
 enum LocalHTTP {
   static func data(for request: URLRequest, instanceID: String) async throws -> (Data, URLResponse) {
     guard let url = request.url, let host = url.host,
           let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) else { throw URLError(.badURL) }
-    let local = LocalConnection(to: .hostPort(host: NWEndpoint.Host(host), port: port), using: .tcp)
-    // The whole exchange has the same 8-second limit as the URLSession requests.
-    local.cancel(after: 8)
-    return try await withTaskCancellationHandler {
+    let message = requestData(request, url: url, host: host)
+    let raw = try await withTimeout(8) {
+      let local = LocalConnection(to: .hostPort(host: NWEndpoint.Host(host), port: port), using: .tcp)
       defer { local.cancel() }
       try await local.verify(instanceID: instanceID)
-      try await local.send(requestData(request, url: url, host: host))
+      try await local.send(message)
       var response = Data()
-      while !isComplete(response) {
+      while !Self.isComplete(response) {
         let (data, closed) = try await local.receive()
         if let data { response.append(data) }
         if closed { break }
       }
-      try Task.checkCancellation()
-      return try parse(response, url: url)
-    } onCancel: {
-      local.cancel()
+      return response
     }
+    return try parse(raw, url: url)
   }
 
   private static func requestData(_ request: URLRequest, url: URL, host: String) -> Data {
