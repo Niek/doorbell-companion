@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Security
 
 typealias JSON = [String: Any]
@@ -99,6 +100,7 @@ final class HomeAssistant {
   private(set) var doorbells: [Doorbell]
   private(set) var localURL: URL?
   private(set) var externalURL: URL?
+  private var instanceID: String?
   private var deviceRegistration: String?
   private var registeredPushToken: String?
   private var registrationServer: URL?
@@ -126,6 +128,7 @@ final class HomeAssistant {
     } ?? []
     localURL = defaults.url(forKey: "local_url")
     externalURL = defaults.url(forKey: "external_url")
+    instanceID = defaults.string(forKey: "instance_id")
     deviceRegistration = defaults.string(forKey: "registration")
     registeredPushToken = defaults.string(forKey: "registered_push_token")
     registrationServer = defaults.url(forKey: "registration_server")
@@ -198,8 +201,10 @@ final class HomeAssistant {
     if credentials?.url != url {
       localURL = nil
       externalURL = nil
+      instanceID = nil
       defaults.removeObject(forKey: "local_url")
       defaults.removeObject(forKey: "external_url")
+      defaults.removeObject(forKey: "instance_id")
       defaults.removeObject(forKey: "ice_servers")
       defaults.removeObject(forKey: "ice_servers_time")
     }
@@ -274,8 +279,14 @@ final class HomeAssistant {
   }
 
   func authorizedSocket(at endpoint: URL, session: URLSession? = nil, token: () async throws -> String) async throws -> HASocket {
-    let socket = HASocket(baseURL: endpoint, session: session ?? webSockets)
+    let local = needsVerification(endpoint)
+    let socket = local ? HASocket(localURL: endpoint) : HASocket(baseURL: endpoint, session: session ?? webSockets)
     do {
+      if local {
+        // The socket's own connection has to reach this Home Assistant before the token goes out on it.
+        guard let instanceID else { throw URLError(.cannotConnectToHost) }
+        try await socket.verify(instanceID: instanceID)
+      }
       guard try await socket.receive()["type"] as? String == "auth_required" else {
         throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
       }
@@ -587,7 +598,7 @@ final class HomeAssistant {
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
     let subscriptionState = try encoder.encode(enabled)
-    if !force, deviceRegistration != nil, registeredPushToken == pushToken,
+    if !force, deviceRegistration != nil, registeredPushToken == pushToken, instanceID != nil,
        defaults.data(forKey: syncKey) == subscriptionState {
       return
     }
@@ -627,6 +638,9 @@ final class HomeAssistant {
     }
     registeredPushToken = pushToken
     defaults.set(pushToken, forKey: "registered_push_token")
+    if force || instanceID == nil, let registration = deviceRegistration {
+      await saveInstanceID(at: endpoint, registration: registration)
+    }
 
     try await syncSharedAutomation(at: endpoint, token: token, refreshTriggers: force)
     guard let registration = deviceRegistration else { throw DoorbellCompanionError("Missing phone registration") }
@@ -731,10 +745,11 @@ final class HomeAssistant {
     doorbells = []
     localURL = nil
     externalURL = nil
+    instanceID = nil
     deviceRegistration = nil
     registeredPushToken = nil
     registrationServer = nil
-    for key in ["doorbells", "local_url", "external_url", "ice_servers", "ice_servers_time",
+    for key in ["doorbells", "local_url", "external_url", "instance_id", "ice_servers", "ice_servers_time",
                 "synced_doorbell_subscription", "registration", "registered_push_token",
                 "registration_server"] {
       defaults.removeObject(forKey: key)
@@ -792,12 +807,12 @@ final class HomeAssistant {
     for endpoint in endpoints {
       do {
         let request = formRequest(at: endpoint, path: "auth/revoke", fields: ["token": token])
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await perform(request, at: endpoint)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 200, data.isEmpty { return true }
         if status == 404 || status == 405 {
           let legacy = formRequest(at: endpoint, path: "auth/token", fields: ["token": token, "action": "revoke"])
-          let (data, response) = try await session.data(for: legacy)
+          let (data, response) = try await perform(legacy, at: endpoint)
           if (response as? HTTPURLResponse)?.statusCode == 200, data.isEmpty { return true }
         }
       } catch {
@@ -839,6 +854,26 @@ final class HomeAssistant {
     try await request(at: endpoint, path: "api/camera_proxy/\(camera)", token: token)
   }
 
+  /// Plain-HTTP addresses other than the sign-in URL use a connection that is verified before the request goes out
+  /// on it. Only that address's request waits, so HTTPS requests in the same race start right away.
+  private func perform(_ request: URLRequest, at endpoint: URL) async throws -> (Data, URLResponse) {
+    guard needsVerification(endpoint) else { return try await session.data(for: request) }
+    guard let instanceID else { throw URLError(.cannotConnectToHost) }
+    return try await LocalHTTP.data(for: request, instanceID: instanceID)
+  }
+
+  private func needsVerification(_ endpoint: URL) -> Bool {
+    endpoint.scheme?.lowercased() == "http" && endpoint.absoluteString.lowercased() != url?.absoluteString.lowercased()
+  }
+
+  private func saveInstanceID(at endpoint: URL, registration: String) async {
+    guard let data = try? await request(at: endpoint, path: "api/webhook/\(registration)", json: ["type": "get_config"]),
+          let config = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
+          let id = config["instance_id"] as? String, !id.isEmpty else { return }
+    instanceID = id
+    defaults.set(id, forKey: "instance_id")
+  }
+
   private func saveDoorbells() {
     defaults.set(try? JSONEncoder().encode(doorbells), forKey: "doorbells")
   }
@@ -852,7 +887,7 @@ final class HomeAssistant {
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
       request.httpBody = try JSONSerialization.data(withJSONObject: json)
     }
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await perform(request, at: url)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     // The automation editor returns 400 for an automation that is already absent.
     let missingAutomation = allowMissing && status == 400 && path.hasPrefix("api/config/automation/") &&
@@ -877,7 +912,14 @@ final class HomeAssistant {
 
   private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
     let request = formRequest(at: url, path: "auth/token", fields: fields)
-    let (data, response) = try await session.data(for: request)
+    // Sign-in uses the URL as entered. Token refreshes go through the local-address check.
+    let result: (Data, URLResponse)
+    if fields["grant_type"] == "authorization_code" {
+      result = try await session.data(for: request)
+    } else {
+      result = try await perform(request, at: url)
+    }
+    let (data, response) = result
     if fields["grant_type"] == "refresh_token", (response as? HTTPURLResponse)?.statusCode == 400,
        let body = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
        body["error"] as? String == "invalid_grant" {
@@ -921,38 +963,74 @@ final class HomeAssistant {
 
 @MainActor
 final class HASocket {
-  private let task: URLSessionWebSocketTask
+  private let task: URLSessionWebSocketTask?
+  /// A local plain-HTTP socket runs on its own connection so it can be verified before the token is sent.
+  private let local: LocalConnection?
   private var nextID = 0
 
   init(baseURL: URL, session: URLSession) {
+    task = session.webSocketTask(with: URLRequest(url: Self.webSocketURL(baseURL), timeoutInterval: 8))
+    local = nil
+    task?.resume()
+  }
+
+  init(localURL baseURL: URL) {
+    let options = NWProtocolWebSocket.Options()
+    options.autoReplyPing = true
+    let parameters = NWParameters.tcp
+    parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+    task = nil
+    local = LocalConnection(to: .url(Self.webSocketURL(baseURL)), using: parameters)
+  }
+
+  private static func webSocketURL(_ baseURL: URL) -> URL {
     var components = URLComponents(url: baseURL.appendingPathComponent("api/websocket"),
                                    resolvingAgainstBaseURL: false)!
     components.scheme = baseURL.scheme == "http" ? "ws" : "wss"
-    task = session.webSocketTask(with: URLRequest(url: components.url!, timeoutInterval: 8))
-    task.resume()
+    return components.url!
   }
 
-  func close() { task.cancel(with: .goingAway, reason: nil) }
+  /// Confirms that this socket's connection reaches Home Assistant `instanceID` on the network it runs on.
+  func verify(instanceID: String) async throws {
+    guard let local else { return }
+    try await withTimeout(8) { try await local.verify(instanceID: instanceID) }
+  }
+
+  func close() {
+    task?.cancel(with: .goingAway, reason: nil)
+    local?.cancel()
+  }
 
   func send(_ object: JSON) async throws {
     let data = try JSONSerialization.data(withJSONObject: object)
-    try await task.send(.string(String(decoding: data, as: UTF8.self)))
+    if let local {
+      let text = NWProtocolWebSocket.Metadata(opcode: .text)
+      try await local.send(data, context: NWConnection.ContentContext(identifier: "text", metadata: [text]))
+    } else {
+      try await task?.send(.string(String(decoding: data, as: UTF8.self)))
+    }
   }
 
   func receive() async throws -> JSON {
     try await withTaskCancellationHandler {
       let data: Data
-      switch try await task.receive() {
-      case .string(let value): data = Data(value.utf8)
-      case .data(let value): data = value
-      @unknown default: throw DoorbellCompanionError("Unknown Home Assistant WebSocket response")
+      if let local {
+        data = try await local.receiveWebSocketMessage()
+      } else if let task {
+        switch try await task.receive() {
+        case .string(let value): data = Data(value.utf8)
+        case .data(let value): data = value
+        @unknown default: throw DoorbellCompanionError("Unknown Home Assistant WebSocket response")
+        }
+      } else {
+        throw HAWebSocketUnavailableError()
       }
       guard let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
         throw DoorbellCompanionError("Invalid Home Assistant WebSocket response")
       }
       return result
-    } onCancel: {
-      task.cancel(with: .goingAway, reason: nil)
+    } onCancel: { [task] in
+      task?.cancel(with: .goingAway, reason: nil)
     }
   }
 
@@ -995,5 +1073,265 @@ final class HASocket {
     message["id"] = id
     try await send(message)
     return id
+  }
+}
+
+/// Runs `body`, or cancels it and throws `URLError(.timedOut)` after `seconds`.
+func withTimeout<T: Sendable>(_ seconds: Double, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+  try await withThrowingTaskGroup(of: T.self) { group in
+    group.addTask(operation: body)
+    group.addTask {
+      try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+      throw URLError(.timedOut)
+    }
+    defer { group.cancelAll() }
+    return try await group.next()!
+  }
+}
+
+/// Confirms that a local plain-HTTP connection reaches the signed-in Home Assistant before it carries credentials.
+/// Home Assistant's mDNS service record includes its instance ID. Once a connection is open, a direct mDNS query
+/// goes to that connection's peer over the same interface, and the reply must contain `uuid=<instance ID>`.
+/// Every connection is checked on its own, so a result never carries over to another network.
+enum LocalHomeAssistant {
+  /// Queries at once and again at 0.4 seconds on a new socket, since a retry on the same socket rarely gets an
+  /// answer after a miss, and gives up at 0.8 seconds.
+  static func isVerified(path: NWPath, host: NWEndpoint.Host, instanceID: String) async -> Bool {
+    var remote: NWEndpoint.Host?
+    if case .hostPort(let address, _)? = path.remoteEndpoint { remote = address }
+    let peer = remote ?? host
+    let interface = path.availableInterfaces.first
+    let expected = Data("uuid=\(instanceID)".utf8)
+    let found = try? await withTimeout(0.8) {
+      await withTaskGroup(of: Bool.self) { group in
+        for delay: UInt64 in [0, 400_000_000] {
+          group.addTask {
+            try? await Task.sleep(nanoseconds: delay)
+            return await Self.query(peer, interface: interface, expected: expected)
+          }
+        }
+        for await found in group where found {
+          group.cancelAll()
+          return true
+        }
+        return false
+      }
+    }
+    return found == true
+  }
+
+  /// Sends a legacy unicast PTR query for `_home-assistant._tcp.local` from a new UDP socket, which gets a direct
+  /// reply. A fresh query ID keeps a retry from being dropped as a duplicate.
+  private static func query(_ host: NWEndpoint.Host, interface: NWInterface?, expected: Data) async -> Bool {
+    guard !Task.isCancelled else { return false }
+    let parameters = NWParameters.udp
+    if let interface { parameters.requiredInterface = interface }
+    let socket = LocalConnection(to: .hostPort(host: host, port: 5353), using: parameters)
+    defer { socket.cancel() }
+    let id = UInt16.random(in: 0...UInt16.max)
+    var packet = Data([UInt8(id >> 8), UInt8(id & 0xff), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+    for label in ["_home-assistant", "_tcp", "local"] {
+      packet.append(UInt8(label.utf8.count))
+      packet.append(contentsOf: label.utf8)
+    }
+    packet.append(contentsOf: [0, 0, 12, 0, 1])
+    do {
+      _ = try await socket.ready()
+      try await socket.send(packet)
+      while true {
+        if let data = try await socket.receiveMessage().0, data.range(of: expected) != nil { return true }
+      }
+    } catch {
+      return false
+    }
+  }
+}
+
+/// One Network framework connection with async helpers. Cancelling the calling task cancels the connection,
+/// and errors surface as `URLError` so callers treat them like URLSession failures.
+final class LocalConnection: @unchecked Sendable {
+  let host: NWEndpoint.Host
+  private let connection: NWConnection
+  private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-connection")
+  private var readyWaiter: CheckedContinuation<NWPath, Error>?
+
+  init(to endpoint: NWEndpoint, using parameters: NWParameters) {
+    switch endpoint {
+    case .hostPort(let host, _): self.host = host
+    case .url(let url): self.host = NWEndpoint.Host(url.host ?? "")
+    default: self.host = NWEndpoint.Host("")
+    }
+    connection = NWConnection(to: endpoint, using: parameters)
+    connection.start(queue: queue)
+  }
+
+  func cancel() { connection.cancel() }
+
+  /// Waits for the connection to open, checks its peer, and confirms the connection is still on the path
+  /// it opened on before anything with credentials is sent.
+  func verify(instanceID: String) async throws {
+    let path = try await ready()
+    guard await LocalHomeAssistant.isVerified(path: path, host: host, instanceID: instanceID),
+          case .ready = connection.state, connection.currentPath == path else {
+      throw URLError(.cannotConnectToHost)
+    }
+  }
+
+  func ready() async throws -> NWPath {
+    try await perform { continuation in
+      queue.async { [self] in
+        readyWaiter = continuation
+        stateChanged(connection.state)
+        connection.stateUpdateHandler = { [self] in stateChanged($0) }
+      }
+    }
+  }
+
+  private func stateChanged(_ state: NWConnection.State) {
+    guard let waiter = readyWaiter else { return }
+    switch state {
+    case .ready:
+      readyWaiter = nil
+      if let path = connection.currentPath {
+        waiter.resume(returning: path)
+      } else {
+        waiter.resume(throwing: URLError(.cannotConnectToHost))
+      }
+    case .failed, .cancelled:
+      readyWaiter = nil
+      waiter.resume(throwing: URLError(.cannotConnectToHost))
+    default:
+      break
+    }
+  }
+
+  func send(_ data: Data, context: NWConnection.ContentContext = .defaultMessage) async throws {
+    try await perform { (continuation: CheckedContinuation<Void, Error>) in
+      connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+        if error != nil { continuation.resume(throwing: URLError(.networkConnectionLost)) } else { continuation.resume() }
+      })
+    }
+  }
+
+  /// Returns the next bytes on the stream, and whether the other side has closed it.
+  func receive() async throws -> (Data?, Bool) {
+    try await perform { continuation in
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+        if error != nil {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume(returning: (data, isComplete))
+        }
+      }
+    }
+  }
+
+  /// Returns the next datagram or WebSocket message.
+  func receiveMessage() async throws -> (Data?, NWConnection.ContentContext?) {
+    try await perform { continuation in
+      connection.receiveMessage { data, context, _, error in
+        if error != nil {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume(returning: (data, context))
+        }
+      }
+    }
+  }
+
+  /// Returns the next text or binary WebSocket message.
+  func receiveWebSocketMessage() async throws -> Data {
+    while true {
+      let (data, context) = try await receiveMessage()
+      let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
+      switch metadata?.opcode {
+      case .text?, .binary?: return data ?? Data()
+      case .ping?, .pong?, .cont?: continue
+      default: throw HAWebSocketUnavailableError()
+      }
+    }
+  }
+
+  /// Waits for one connection callback. Cancelling the task cancels the connection, which ends the callback.
+  private func perform<T>(_ start: (CheckedContinuation<T, Error>) -> Void) async throws -> T {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation(start)
+    } onCancel: { [connection] in
+      connection.cancel()
+    }
+  }
+}
+
+/// Sends one HTTP/1.0 request to a local Home Assistant address. The connection opens first, its peer and
+/// network are verified, and only then does the request, with its credentials, go out on that connection.
+/// The whole exchange has the same 8-second limit as the URLSession requests.
+enum LocalHTTP {
+  static func data(for request: URLRequest, instanceID: String) async throws -> (Data, URLResponse) {
+    guard let url = request.url, let host = url.host,
+          let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) else { throw URLError(.badURL) }
+    let message = requestData(request, url: url, host: host)
+    let raw = try await withTimeout(8) {
+      let local = LocalConnection(to: .hostPort(host: NWEndpoint.Host(host), port: port), using: .tcp)
+      defer { local.cancel() }
+      try await local.verify(instanceID: instanceID)
+      try await local.send(message)
+      var response = Data()
+      while !Self.isComplete(response) {
+        let (data, closed) = try await local.receive()
+        if let data { response.append(data) }
+        if closed { break }
+      }
+      return response
+    }
+    return try parse(raw, url: url)
+  }
+
+  private static func requestData(_ request: URLRequest, url: URL, host: String) -> Data {
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    var target = components?.percentEncodedPath ?? ""
+    if target.isEmpty { target = "/" }
+    if let query = components?.percentEncodedQuery { target += "?\(query)" }
+    let body = request.httpBody ?? Data()
+    // HTTP/1.0 keeps the response unchunked.
+    var head = "\(request.httpMethod ?? "GET") \(target) HTTP/1.0\r\n"
+    head += "Host: \(host)\(url.port.map { ":\($0)" } ?? "")\r\nContent-Length: \(body.count)\r\n"
+    for (name, value) in request.allHTTPHeaderFields ?? [:] { head += "\(name): \(value)\r\n" }
+    return Data((head + "\r\n").utf8) + body
+  }
+
+  /// A response with Content-Length is complete once its body has arrived. Otherwise it ends when the connection closes.
+  private static func isComplete(_ response: Data) -> Bool {
+    guard let end = response.range(of: Data("\r\n\r\n".utf8)),
+          let length = headers(response[..<end.lowerBound])["content-length"].flatMap({ Int($0) }) else {
+      return false
+    }
+    return response.count - end.upperBound >= length
+  }
+
+  private static func headers(_ head: Data) -> [String: String] {
+    var headers: [String: String] = [:]
+    for line in String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n").dropFirst() {
+      guard let colon = line.firstIndex(of: ":") else { continue }
+      headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+    }
+    return headers
+  }
+
+  private static func parse(_ response: Data, url: URL) throws -> (Data, URLResponse) {
+    guard let end = response.range(of: Data("\r\n\r\n".utf8)) else { throw URLError(.badServerResponse) }
+    let head = response[..<end.lowerBound]
+    let status = String(decoding: head, as: UTF8.self).prefix { $0 != "\r" }.split(separator: " ")
+    var body = Data(response[end.upperBound...])
+    let fields = headers(head)
+    if let length = fields["content-length"].flatMap({ Int($0) }) {
+      // The connection closed before the whole body arrived.
+      guard body.count >= length else { throw URLError(.networkConnectionLost) }
+      body = body.prefix(length)
+    }
+    guard status.count >= 2, let code = Int(status[1]),
+          let httpResponse = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.0", headerFields: fields) else {
+      throw URLError(.badServerResponse)
+    }
+    return (body, httpResponse)
   }
 }

@@ -9,6 +9,7 @@ import io.flutter.FlutterInjector
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.FormBody
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -49,10 +50,25 @@ object HomeAssistantAuth {
 
     val ioExecutor: ExecutorService = Executors.newCachedThreadPool()
 
+    /** Plain-HTTP Home Assistant origins other than the sign-in URL, with the host and instance ID each must confirm. */
+    private val unverifiedHttpOrigins = ConcurrentHashMap<String, Pair<String, String>>()
+    @Volatile private var instanceIdFetchedAt = 0L
+
     val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
+        .dns(LocalHomeAssistant.dns)
+        .socketFactory(LocalHomeAssistant.socketFactory)
+        .addInterceptor { chain ->
+            // Only plain-HTTP calls wait here, on their own thread, so HTTPS calls in the same race start right away.
+            val url = chain.request().url
+            val instanceId = unverifiedHttpOrigins[origin(url)]?.second
+            if (instanceId != null && !LocalHomeAssistant.isVerified(url.host, instanceId)) {
+                throw IOException("Home Assistant at ${url.host} did not confirm its identity")
+            }
+            chain.proceed(chain.request())
+        }
         .build()
 
     @Volatile private var cachedToken: String? = null
@@ -93,10 +109,47 @@ object HomeAssistantAuth {
     fun getExternalUrl(context: Context): String? =
         prefs(context).getString("ha_external_url", null)?.takeIf { it.isNotBlank() }?.trimEnd('/')
 
-    /** Deduplicated Home Assistant endpoints ordered LAN-first, then external, then primary sign-in URL. */
-    fun endpoints(context: Context): List<String> =
-        listOfNotNull(getInternalUrl(context), getExternalUrl(context), getBaseUrl(context)?.trimEnd('/'))
+    /**
+     * Deduplicated Home Assistant endpoints ordered LAN-first, then external, then primary sign-in URL.
+     * Plain-HTTP endpoints other than the sign-in URL only get requests after they confirm the instance ID.
+     */
+    fun endpoints(context: Context): List<String> {
+        val signInUrl = getBaseUrl(context)?.trimEnd('/')
+        val urls = listOfNotNull(getInternalUrl(context), getExternalUrl(context), signInUrl)
             .distinctBy { it.lowercase() }
+        val instanceId = prefs(context).getString("ha_instance_id", null).orEmpty()
+        for (url in urls) {
+            val parsed = url.toHttpUrlOrNull()?.takeIf { !it.isHttps } ?: continue
+            if (url.equals(signInUrl, ignoreCase = true)) {
+                unverifiedHttpOrigins.remove(origin(parsed))
+            } else {
+                unverifiedHttpOrigins[origin(parsed)] = parsed.host to instanceId
+            }
+        }
+        LocalHomeAssistant.watch(context) { unverifiedHttpOrigins.values.toList() }
+        if (instanceId.isBlank() && unverifiedHttpOrigins.isNotEmpty()) fetchInstanceId(context, urls)
+        return urls
+    }
+
+    private fun origin(url: HttpUrl) = "${url.scheme}://${url.host}:${url.port}"
+
+    /** Installs from before local verification have no instance ID; fetch it in the background, at most once a minute. */
+    private fun fetchInstanceId(context: Context, urls: List<String>) {
+        val webhookId = prefs(context).getString("ha_webhook_id", null)?.takeIf { it.isNotBlank() } ?: return
+        val now = System.currentTimeMillis()
+        synchronized(this) {
+            if (now - instanceIdFetchedAt < 60_000L) return
+            instanceIdFetchedAt = now
+        }
+        val appContext = context.applicationContext
+        ioExecutor.execute {
+            // Unverified local addresses are refused without a probe, so this reaches Home Assistant over HTTPS.
+            if (urls.any { saveInstanceId(appContext, it, webhookId) }) {
+                endpoints(appContext)
+                unverifiedHttpOrigins.values.forEach { (host, id) -> LocalHomeAssistant.isVerified(host, id) }
+            }
+        }
+    }
 
     fun saveInternalUrl(context: Context, rawUrl: String?) {
         val normalized = rawUrl?.trim()?.takeIf { it.isNotBlank() && it != "null" }
@@ -152,6 +205,7 @@ object HomeAssistantAuth {
                 .remove("ha_data_channels")
                 .remove("ha_registered_push_token")
                 .remove("ha_legacy_device")
+                .remove("ha_instance_id")
                 .remove(SYNCED_SUBSCRIPTION)
                 .remove(PENDING_REVOCATION)
                 .apply()
@@ -318,6 +372,8 @@ object HomeAssistantAuth {
             .add("code_verifier", verifier)
             .build()
         val req = Request.Builder().url("$cleanUrl/auth/token").post(form).build()
+        // The URL the user signs in to is trusted as entered, even if an earlier sign-in found it on the LAN.
+        unverifiedHttpOrigins.remove(origin(req.url))
         var lastError: Exception? = null
         for (attempt in 1..6) {
             try {
@@ -337,6 +393,7 @@ object HomeAssistantAuth {
                         if (prefs.getString("ha_url", null) != cleanUrl) {
                             editor.remove("ha_internal_url")
                                 .remove("ha_external_url")
+                                .remove("ha_instance_id")
                                 .remove("ha_webhook_id")
                                 .remove("ha_registered_push_token")
                                 .remove("ha_notify_service")
@@ -917,6 +974,9 @@ object HomeAssistantAuth {
             p.edit().putString("ha_webhook_id", webhookId).remove("ha_notify_service").apply()
             Thread.sleep(500)
         }
+        if (refreshTriggers || p.getString("ha_instance_id", null).isNullOrBlank()) {
+            webhookId?.let { saveInstanceId(context, endpoint, it) }
+        }
 
         syncSharedAutomation(context, endpoint, token, refreshTriggers)
         val routes = JSONObject()
@@ -954,6 +1014,24 @@ object HomeAssistantAuth {
             .putString(SYNCED_SUBSCRIPTION, fingerprint)
             .apply()
         notifyService
+    }
+
+    /** Stores the instance ID that local plain-HTTP addresses must confirm before they get credentials. */
+    private fun saveInstanceId(context: Context, endpoint: String, webhookId: String): Boolean {
+        val request = Request.Builder().url("$endpoint/api/webhook/$webhookId")
+            .post(JSONObject().put("type", "get_config").toString().toRequestBody(jsonMedia))
+            .build()
+        return try {
+            httpClient.newCall(request).execute().use { response ->
+                val instanceId = JSONObject(response.body?.string().orEmpty()).optString("instance_id")
+                (response.isSuccessful && instanceId.isNotBlank()).also { saved ->
+                    if (saved) prefs(context).edit().putString("ha_instance_id", instanceId).apply()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("DoorbellCompanion", "Could not read the Home Assistant instance ID: ${e.message}")
+            false
+        }
     }
 
     private fun syncSharedAutomation(context: Context, baseUrl: String, token: String, refreshTriggers: Boolean) {
