@@ -132,6 +132,7 @@ final class HomeAssistant {
     deviceRegistration = defaults.string(forKey: "registration")
     registeredPushToken = defaults.string(forKey: "registered_push_token")
     registrationServer = defaults.url(forKey: "registration_server")
+    LocalHomeAssistant.watch { [weak self] in self?.localTargets ?? [] }
   }
 
   nonisolated static func serverURL(_ raw: String) throws -> URL {
@@ -852,13 +853,22 @@ final class HomeAssistant {
   }
 
   /// Plain-HTTP addresses other than the sign-in URL get credentials only after they confirm this instance's ID.
+  /// Only that address's request waits, so HTTPS requests in the same race start right away.
   private func verifyLocalEndpoint(_ endpoint: URL) async throws {
-    guard endpoint.scheme?.lowercased() == "http",
-          endpoint.absoluteString.lowercased() != url?.absoluteString.lowercased() else { return }
+    guard needsVerification(endpoint) else { return }
     guard let instanceID, let host = endpoint.host,
           await LocalHomeAssistant.isVerified(host: host, instanceID: instanceID) else {
       throw URLError(.cannotConnectToHost)
     }
+  }
+
+  private func needsVerification(_ endpoint: URL) -> Bool {
+    endpoint.scheme?.lowercased() == "http" && endpoint.absoluteString.lowercased() != url?.absoluteString.lowercased()
+  }
+
+  private var localTargets: [(host: String, instanceID: String)] {
+    guard let instanceID else { return [] }
+    return endpoints.filter { needsVerification($0) }.compactMap { $0.host }.map { (host: $0, instanceID: instanceID) }
   }
 
   private func saveInstanceID(at endpoint: URL, registration: String) async {
@@ -1032,56 +1042,56 @@ final class HASocket {
 /// Confirms that a plain-HTTP address is the signed-in Home Assistant before it receives credentials.
 /// Home Assistant's mDNS service record includes its instance ID, so a direct mDNS query to the address
 /// must return `uuid=<instance ID>`. Another device that happens to use the same address can't do that.
+/// A successful check only counts until the network changes.
 @MainActor
 enum LocalHomeAssistant {
-  private static var verifiedAt: [String: Date] = [:]
+  private static var verified: Set<String> = []
+  private static var generation = 0
+  private static var monitor: NWPathMonitor?
+  private static var sawFirstPath = false
 
+  /// Clears checks when the network changes, then rechecks `targets` on the new network.
+  static func watch(targets: @escaping @MainActor () -> [(host: String, instanceID: String)]) {
+    guard monitor == nil else { return }
+    let monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { _ in
+      Task { @MainActor in
+        // The first update reports the network the app already uses, so checks in progress stay valid.
+        if sawFirstPath {
+          generation += 1
+          verified.removeAll()
+        }
+        sawFirstPath = true
+        for target in targets() {
+          _ = await isVerified(host: target.host, instanceID: target.instanceID)
+        }
+      }
+    }
+    monitor.start(queue: .main)
+    self.monitor = monitor
+  }
+
+  /// Returns whether `host` confirmed `instanceID` on the current network, checking it now if needed.
   static func isVerified(host: String, instanceID: String) async -> Bool {
     let key = "\(host)/\(instanceID)"
-    if let date = verifiedAt[key], Date().timeIntervalSince(date) < 30 { return true }
-    let verified = await query(host: host, expected: Data("uuid=\(instanceID)".utf8))
-    if verified { verifiedAt[key] = Date() }
-    return verified
+    if verified.contains(key) { return true }
+    let started = generation
+    let confirmed = await query(host: host, expected: Data("uuid=\(instanceID)".utf8))
+    // A check that started before a network change says nothing about the new network.
+    guard confirmed, started == generation else { return false }
+    verified.insert(key)
+    return true
   }
 
   private nonisolated static func query(host: String, expected: Data) async -> Bool {
     await withCheckedContinuation { continuation in
-      let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
-      let connection = NWConnection(host: NWEndpoint.Host(host), port: 5353, using: .udp)
-      var finished = false
-      func finish(_ verified: Bool) {
-        guard !finished else { return }
-        finished = true
-        connection.cancel()
-        continuation.resume(returning: verified)
-      }
-      func receive() {
-        connection.receiveMessage { data, _, _, error in
-          if let data, data.range(of: expected) != nil { return finish(true) }
-          if error == nil { receive() }
-        }
-      }
-      func send() { connection.send(content: serviceQuery(), completion: .idempotent) }
-      connection.stateUpdateHandler = { state in
-        switch state {
-        case .ready:
-          receive()
-          send()
-          queue.asyncAfter(deadline: .now() + 0.4) { send() }
-        case .failed, .cancelled:
-          finish(false)
-        default:
-          break
-        }
-      }
-      queue.asyncAfter(deadline: .now() + 0.8) { finish(false) }
-      connection.start(queue: queue)
+      MDNSProbe(host: host, expected: expected) { continuation.resume(returning: $0) }.start()
     }
   }
 
   /// A legacy unicast PTR query for `_home-assistant._tcp.local`, which gets a direct reply.
   /// A fresh ID keeps a retry from being dropped as a duplicate.
-  private nonisolated static func serviceQuery() -> Data {
+  nonisolated static func serviceQuery() -> Data {
     let id = UInt16.random(in: 0...UInt16.max)
     var packet = Data([UInt8(id >> 8), UInt8(id & 0xff), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
     for label in ["_home-assistant", "_tcp", "local"] {
@@ -1090,5 +1100,56 @@ enum LocalHomeAssistant {
     }
     packet.append(contentsOf: [0, 0, 12, 0, 1])
     return packet
+  }
+}
+
+/// Sends the instance-ID query to one address, retries once, and gives up after 0.8 seconds.
+private final class MDNSProbe {
+  private let connection: NWConnection
+  private let expected: Data
+  private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
+  private var completion: ((Bool) -> Void)?
+
+  init(host: String, expected: Data, completion: @escaping (Bool) -> Void) {
+    connection = NWConnection(host: NWEndpoint.Host(host), port: 5353, using: .udp)
+    self.expected = expected
+    self.completion = completion
+  }
+
+  func start() {
+    connection.stateUpdateHandler = { [self] state in
+      switch state {
+      case .ready:
+        receive()
+        send()
+        queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
+      case .failed, .cancelled:
+        finish(false)
+      default:
+        break
+      }
+    }
+    queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
+    connection.start(queue: queue)
+  }
+
+  private func send() {
+    guard completion != nil else { return }
+    connection.send(content: LocalHomeAssistant.serviceQuery(), completion: .idempotent)
+  }
+
+  private func receive() {
+    connection.receiveMessage { [self] data, _, _, error in
+      if let data, data.range(of: expected) != nil { return finish(true) }
+      if error == nil, completion != nil { receive() }
+    }
+  }
+
+  private func finish(_ verified: Bool) {
+    guard let completion else { return }
+    self.completion = nil
+    connection.stateUpdateHandler = nil
+    connection.cancel()
+    completion(verified)
   }
 }

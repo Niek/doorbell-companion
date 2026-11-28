@@ -1,39 +1,74 @@
 package nl.niek.doorbellcompanion
 
-import android.os.SystemClock
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.thread
 import kotlin.random.Random
 
 /**
  * Confirms that a plain-HTTP address is the signed-in Home Assistant before it receives credentials.
  * Home Assistant's mDNS service record includes its instance ID, so a direct mDNS query to the address
  * must return `uuid=<instance ID>`. Another device that happens to use the same address can't do that.
+ * A successful check only counts for the network it ran on.
  */
 object LocalHomeAssistant {
-    private const val CACHE_MS = 30_000L
-    private val verifiedAt = ConcurrentHashMap<String, Long>()
+    private val verified: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    @Volatile private var generation = 0
+    @Volatile private var connectivity: ConnectivityManager? = null
     private val serviceName = listOf("_home-assistant", "_tcp", "local")
         .fold(byteArrayOf()) { name, label -> name + label.length.toByte() + label.toByteArray() } + 0.toByte()
 
+    /** Clears checks when the default network changes, then rechecks [targets] (host to instance ID) on the new one. */
+    @Synchronized
+    fun watch(context: Context, targets: () -> Collection<Pair<String, String>>) {
+        if (connectivity != null) return
+        val manager = context.applicationContext.getSystemService(ConnectivityManager::class.java) ?: return
+        connectivity = manager
+        manager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+            private var current = manager.activeNetwork
+
+            override fun onAvailable(network: Network) {
+                // The first callback reports the network the app already uses, so checks in progress stay valid.
+                if (network != current) changed(network)
+                targets().forEach { (host, instanceId) -> thread { isVerified(host, instanceId) } }
+            }
+
+            override fun onLost(network: Network) = changed(null)
+
+            private fun changed(network: Network?) {
+                current = network
+                generation++
+                verified.clear()
+            }
+        })
+    }
+
+    /** Returns whether [host] confirmed [instanceId] on the current network, checking it now if needed. */
     fun isVerified(host: String, instanceId: String): Boolean {
         if (instanceId.isBlank()) return false
-        val key = "$host/$instanceId"
-        val now = SystemClock.elapsedRealtime()
-        if (verifiedAt[key]?.let { now - it < CACHE_MS } == true) return true
-        val verified = try {
-            query(InetAddress.getByName(host), "uuid=$instanceId".toByteArray())
+        val started = generation
+        val network = connectivity?.activeNetwork
+        val key = "$network/$host/$instanceId"
+        if (key in verified) return true
+        val confirmed = try {
+            query(network, InetAddress.getByName(host), "uuid=$instanceId".toByteArray())
         } catch (_: Exception) {
             false
         }
-        if (verified) verifiedAt[key] = now
-        return verified
+        // A check that started before a network change says nothing about the new network.
+        if (!confirmed || started != generation) return false
+        verified += key
+        return true
     }
 
-    private fun query(address: InetAddress, expected: ByteArray): Boolean = DatagramSocket().use { socket ->
+    private fun query(network: Network?, address: InetAddress, expected: ByteArray): Boolean = DatagramSocket().use { socket ->
+        network?.bindSocket(socket)
         socket.connect(address, 5353)
         socket.soTimeout = 400
         val buffer = ByteArray(9000)

@@ -50,16 +50,17 @@ object HomeAssistantAuth {
 
     val ioExecutor: ExecutorService = Executors.newCachedThreadPool()
 
-    /** Plain-HTTP Home Assistant addresses other than the sign-in URL, with the instance ID each must confirm. */
-    private val unverifiedHttpOrigins = ConcurrentHashMap<String, String>()
+    /** Plain-HTTP Home Assistant origins other than the sign-in URL, with the host and instance ID each must confirm. */
+    private val unverifiedHttpOrigins = ConcurrentHashMap<String, Pair<String, String>>()
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .addInterceptor { chain ->
+            // Only plain-HTTP calls wait here, on their own thread, so HTTPS calls in the same race start right away.
             val url = chain.request().url
-            val instanceId = unverifiedHttpOrigins[origin(url)]
+            val instanceId = unverifiedHttpOrigins[origin(url)]?.second
             if (instanceId != null && !LocalHomeAssistant.isVerified(url.host, instanceId)) {
                 throw IOException("Home Assistant at ${url.host} did not confirm its identity")
             }
@@ -119,9 +120,10 @@ object HomeAssistantAuth {
             if (url.equals(signInUrl, ignoreCase = true)) {
                 unverifiedHttpOrigins.remove(origin(parsed))
             } else {
-                unverifiedHttpOrigins[origin(parsed)] = instanceId
+                unverifiedHttpOrigins[origin(parsed)] = parsed.host to instanceId
             }
         }
+        LocalHomeAssistant.watch(context) { unverifiedHttpOrigins.values.toList() }
         return urls
     }
 
