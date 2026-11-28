@@ -235,7 +235,6 @@ final class HomeAssistant {
         for endpoint in candidates {
           group.addTask { @MainActor in
             do {
-              try await self.verifyLocalEndpoint(endpoint)
               let response = try await self.tokenResponse(url: endpoint, fields: fields)
               guard let access = response["access_token"] as? String, !access.isEmpty else {
                 throw DoorbellCompanionError("Home Assistant did not return an access token")
@@ -281,12 +280,17 @@ final class HomeAssistant {
   }
 
   func authorizedSocket(at endpoint: URL, session: URLSession? = nil, token: () async throws -> String) async throws -> HASocket {
-    let socket = HASocket(baseURL: endpoint, session: session ?? webSockets)
+    let local = needsVerification(endpoint)
+    let socket = local ? HASocket(localURL: endpoint) : HASocket(baseURL: endpoint, session: session ?? webSockets)
     do {
+      if local {
+        // The socket's own connection has to reach this Home Assistant before the token goes out on it.
+        guard let instanceID else { throw URLError(.cannotConnectToHost) }
+        try await socket.verify(instanceID: instanceID)
+      }
       guard try await socket.receive()["type"] as? String == "auth_required" else {
         throw DoorbellCompanionError("Unexpected Home Assistant WebSocket response")
       }
-      try await verifyLocalEndpoint(endpoint)
       let access = try await token()
       try Task.checkCancellation()
       try await socket.send(["type": "auth", "access_token": access])
@@ -803,14 +807,13 @@ final class HomeAssistant {
   private func revokeSession(at endpoints: [URL], token: String) async -> Bool {
     for endpoint in endpoints {
       do {
-        try await verifyLocalEndpoint(endpoint)
         let request = formRequest(at: endpoint, path: "auth/revoke", fields: ["token": token])
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await perform(request, at: endpoint)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 200, data.isEmpty { return true }
         if status == 404 || status == 405 {
           let legacy = formRequest(at: endpoint, path: "auth/token", fields: ["token": token, "action": "revoke"])
-          let (data, response) = try await session.data(for: legacy)
+          let (data, response) = try await perform(legacy, at: endpoint)
           if (response as? HTTPURLResponse)?.statusCode == 200, data.isEmpty { return true }
         }
       } catch {
@@ -852,14 +855,12 @@ final class HomeAssistant {
     try await request(at: endpoint, path: "api/camera_proxy/\(camera)", token: token)
   }
 
-  /// Plain-HTTP addresses other than the sign-in URL get credentials only after they confirm this instance's ID.
-  /// Only that address's request waits, so HTTPS requests in the same race start right away.
-  private func verifyLocalEndpoint(_ endpoint: URL) async throws {
-    guard needsVerification(endpoint) else { return }
-    guard let instanceID, let host = endpoint.host,
-          await LocalHomeAssistant.isVerified(host: host, instanceID: instanceID) else {
-      throw URLError(.cannotConnectToHost)
-    }
+  /// Plain-HTTP addresses other than the sign-in URL use a connection that is verified before the request goes out
+  /// on it. Only that address's request waits, so HTTPS requests in the same race start right away.
+  private func perform(_ request: URLRequest, at endpoint: URL) async throws -> (Data, URLResponse) {
+    guard needsVerification(endpoint) else { return try await session.data(for: request) }
+    guard let instanceID else { throw URLError(.cannotConnectToHost) }
+    return try await LocalHTTP.data(for: request, instanceID: instanceID)
   }
 
   private func needsVerification(_ endpoint: URL) -> Bool {
@@ -885,7 +886,6 @@ final class HomeAssistant {
 
   private func request(at url: URL, path: String, token: String? = nil, json: JSON? = nil,
                        method: String? = nil, allowMissing: Bool = false) async throws -> Data {
-    try await verifyLocalEndpoint(url)
     var request = URLRequest(url: url.appendingPathComponent(path), timeoutInterval: 8)
     request.httpMethod = method ?? (json == nil ? "GET" : "POST")
     if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -893,7 +893,7 @@ final class HomeAssistant {
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
       request.httpBody = try JSONSerialization.data(withJSONObject: json)
     }
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await perform(request, at: url)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     // The automation editor returns 400 for an automation that is already absent.
     let missingAutomation = allowMissing && status == 400 && path.hasPrefix("api/config/automation/") &&
@@ -918,7 +918,14 @@ final class HomeAssistant {
 
   private func tokenResponse(url: URL, fields: [String: String]) async throws -> JSON {
     let request = formRequest(at: url, path: "auth/token", fields: fields)
-    let (data, response) = try await session.data(for: request)
+    // Sign-in uses the URL as entered. Token refreshes go through the local-address check.
+    let result: (Data, URLResponse)
+    if fields["grant_type"] == "authorization_code" {
+      result = try await session.data(for: request)
+    } else {
+      result = try await perform(request, at: url)
+    }
+    let (data, response) = result
     if fields["grant_type"] == "refresh_token", (response as? HTTPURLResponse)?.statusCode == 400,
        let body = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
        body["error"] as? String == "invalid_grant" {
@@ -962,38 +969,78 @@ final class HomeAssistant {
 
 @MainActor
 final class HASocket {
-  private let task: URLSessionWebSocketTask
+  private let task: URLSessionWebSocketTask?
+  /// A local plain-HTTP socket runs on its own connection so it can be verified before the token is sent.
+  private let local: LocalConnection?
   private var nextID = 0
 
   init(baseURL: URL, session: URLSession) {
+    task = session.webSocketTask(with: URLRequest(url: Self.webSocketURL(baseURL), timeoutInterval: 8))
+    local = nil
+    task?.resume()
+  }
+
+  init(localURL baseURL: URL) {
+    let options = NWProtocolWebSocket.Options()
+    options.autoReplyPing = true
+    let parameters = NWParameters.tcp
+    parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+    task = nil
+    local = LocalConnection(to: .url(Self.webSocketURL(baseURL)), using: parameters)
+  }
+
+  private static func webSocketURL(_ baseURL: URL) -> URL {
     var components = URLComponents(url: baseURL.appendingPathComponent("api/websocket"),
                                    resolvingAgainstBaseURL: false)!
     components.scheme = baseURL.scheme == "http" ? "ws" : "wss"
-    task = session.webSocketTask(with: URLRequest(url: components.url!, timeoutInterval: 8))
-    task.resume()
+    return components.url!
   }
 
-  func close() { task.cancel(with: .goingAway, reason: nil) }
+  /// Confirms that this socket's connection reaches Home Assistant `instanceID` on the network it runs on.
+  func verify(instanceID: String) async throws {
+    guard let local else { return }
+    let path = try await local.ready()
+    guard await LocalHomeAssistant.isVerified(path: path, host: local.host, instanceID: instanceID) else {
+      throw URLError(.cannotConnectToHost)
+    }
+  }
+
+  func close() {
+    task?.cancel(with: .goingAway, reason: nil)
+    local?.cancel()
+  }
 
   func send(_ object: JSON) async throws {
     let data = try JSONSerialization.data(withJSONObject: object)
-    try await task.send(.string(String(decoding: data, as: UTF8.self)))
+    if let local {
+      let text = NWProtocolWebSocket.Metadata(opcode: .text)
+      try await local.send(data, context: NWConnection.ContentContext(identifier: "text", metadata: [text]))
+    } else {
+      try await task?.send(.string(String(decoding: data, as: UTF8.self)))
+    }
   }
 
   func receive() async throws -> JSON {
     try await withTaskCancellationHandler {
       let data: Data
-      switch try await task.receive() {
-      case .string(let value): data = Data(value.utf8)
-      case .data(let value): data = value
-      @unknown default: throw DoorbellCompanionError("Unknown Home Assistant WebSocket response")
+      if let local {
+        data = try await local.receiveWebSocketMessage()
+      } else if let task {
+        switch try await task.receive() {
+        case .string(let value): data = Data(value.utf8)
+        case .data(let value): data = value
+        @unknown default: throw DoorbellCompanionError("Unknown Home Assistant WebSocket response")
+        }
+      } else {
+        throw HAWebSocketUnavailableError()
       }
       guard let result = try JSONSerialization.jsonObject(with: data) as? JSON else {
         throw DoorbellCompanionError("Invalid Home Assistant WebSocket response")
       }
       return result
-    } onCancel: {
-      task.cancel(with: .goingAway, reason: nil)
+    } onCancel: { [task, local] in
+      task?.cancel(with: .goingAway, reason: nil)
+      local?.cancel()
     }
   }
 
@@ -1042,11 +1089,11 @@ final class HASocket {
 /// Confirms that a plain-HTTP address is the signed-in Home Assistant before it receives credentials.
 /// Home Assistant's mDNS service record includes its instance ID, so a direct mDNS query to the address
 /// must return `uuid=<instance ID>`. Another device that happens to use the same address can't do that.
-/// A successful check only counts until the network changes.
+/// A check counts for one network: the peer address, the phone's address, the gateways and the interface.
+/// Credential-bearing connections are opened first, and their own path has to match a verified network.
 @MainActor
 enum LocalHomeAssistant {
   private static var verified: Set<String> = []
-  private static var generation = 0
   private static var monitor: NWPathMonitor?
   private static var sawFirstPath = false
 
@@ -1056,14 +1103,13 @@ enum LocalHomeAssistant {
     let monitor = NWPathMonitor()
     monitor.pathUpdateHandler = { _ in
       Task { @MainActor in
-        // The first update reports the network the app already uses, so checks in progress stay valid.
-        if sawFirstPath {
-          generation += 1
-          verified.removeAll()
-        }
+        // The first update reports the network the app already uses, so earlier checks stay valid.
+        if sawFirstPath { verified.removeAll() }
         sawFirstPath = true
         for target in targets() {
-          _ = await isVerified(host: target.host, instanceID: target.instanceID)
+          if let key = await query(host: NWEndpoint.Host(target.host), interface: nil, instanceID: target.instanceID) {
+            verified.insert(key)
+          }
         }
       }
     }
@@ -1071,20 +1117,34 @@ enum LocalHomeAssistant {
     self.monitor = monitor
   }
 
-  /// Returns whether `host` confirmed `instanceID` on the current network, checking it now if needed.
-  static func isVerified(host: String, instanceID: String) async -> Bool {
-    let key = "\(host)/\(instanceID)"
+  /// Returns whether the peer of an open connection on `path` is Home Assistant `instanceID` on that same network.
+  static func isVerified(path: NWPath, host: NWEndpoint.Host, instanceID: String) async -> Bool {
+    let peer = remoteHost(path) ?? host
+    let key = networkKey(path, peer: peer, instanceID: instanceID)
     if verified.contains(key) { return true }
-    let started = generation
-    let confirmed = await query(host: host, expected: Data("uuid=\(instanceID)".utf8))
-    // A check that started before a network change says nothing about the new network.
-    guard confirmed, started == generation else { return false }
+    // Probe the connection's peer over the connection's interface. Its path must describe the same network.
+    guard await query(host: peer, interface: path.availableInterfaces.first, instanceID: instanceID) == key else {
+      return false
+    }
     verified.insert(key)
     return true
   }
 
-  private nonisolated static func query(host: String, expected: Data) async -> Bool {
-    let probe = MDNSProbe(host: host, expected: expected)
+  private nonisolated static func remoteHost(_ path: NWPath?) -> NWEndpoint.Host? {
+    if case .hostPort(let host, _)? = path?.remoteEndpoint { return host }
+    return nil
+  }
+
+  nonisolated static func networkKey(_ path: NWPath?, peer: NWEndpoint.Host, instanceID: String) -> String {
+    var phone = "-"
+    if case .hostPort(let host, _)? = path?.localEndpoint { phone = "\(host)" }
+    let gateways = (path?.gateways ?? []).map { "\($0)" }.sorted().joined(separator: ",")
+    return [instanceID, "\(peer)", phone, gateways, path?.availableInterfaces.first?.name ?? "-"].joined(separator: " ")
+  }
+
+  /// Returns the network key of the probe's path when `host` answers with `instanceID`.
+  private nonisolated static func query(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) async -> String? {
+    let probe = MDNSProbe(host: host, interface: interface, instanceID: instanceID)
     // A cancelled race stops the probe at once, so the losing branch doesn't hold up the winner.
     return await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
@@ -1113,20 +1173,24 @@ enum LocalHomeAssistant {
 /// All state changes run on `queue`.
 private final class MDNSProbe: @unchecked Sendable {
   private let connection: NWConnection
-  private let expected: Data
+  private let host: NWEndpoint.Host
+  private let instanceID: String
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
-  private var completion: ((Bool) -> Void)?
+  private var completion: ((String?) -> Void)?
   private var cancelled = false
 
-  init(host: String, expected: Data) {
-    connection = NWConnection(host: NWEndpoint.Host(host), port: 5353, using: .udp)
-    self.expected = expected
+  init(host: NWEndpoint.Host, interface: NWInterface?, instanceID: String) {
+    let parameters = NWParameters.udp
+    if let interface { parameters.requiredInterface = interface }
+    connection = NWConnection(host: host, port: 5353, using: parameters)
+    self.host = host
+    self.instanceID = instanceID
   }
 
-  func start(_ completion: @escaping (Bool) -> Void) {
+  func start(_ completion: @escaping (String?) -> Void) {
     queue.async { [self] in
       self.completion = completion
-      if cancelled { return finish(false) }
+      if cancelled { return finish(nil) }
       connection.stateUpdateHandler = { [self] state in
         switch state {
         case .ready:
@@ -1134,12 +1198,12 @@ private final class MDNSProbe: @unchecked Sendable {
           send()
           queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
         case .failed, .cancelled:
-          finish(false)
+          finish(nil)
         default:
           break
         }
       }
-      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
+      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(nil) }
       connection.start(queue: queue)
     }
   }
@@ -1147,7 +1211,7 @@ private final class MDNSProbe: @unchecked Sendable {
   func cancel() {
     queue.async { [self] in
       cancelled = true
-      finish(false)
+      finish(nil)
     }
   }
 
@@ -1158,16 +1222,171 @@ private final class MDNSProbe: @unchecked Sendable {
 
   private func receive() {
     connection.receiveMessage { [self] data, _, _, error in
-      if let data, data.range(of: expected) != nil { return finish(true) }
+      if let data, data.range(of: Data("uuid=\(instanceID)".utf8)) != nil {
+        return finish(LocalHomeAssistant.networkKey(connection.currentPath, peer: host, instanceID: instanceID))
+      }
       if error == nil, completion != nil { receive() }
     }
   }
 
-  private func finish(_ verified: Bool) {
+  private func finish(_ key: String?) {
     guard let completion else { return }
     self.completion = nil
     connection.stateUpdateHandler = nil
     connection.cancel()
-    completion(verified)
+    completion(key)
+  }
+}
+
+/// One Network framework connection with async helpers. It gives up if it isn't ready within 8 seconds,
+/// like the URLSession requests. Waiting state runs on `queue`.
+final class LocalConnection: @unchecked Sendable {
+  let host: NWEndpoint.Host
+  private let connection: NWConnection
+  private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-connection")
+  private var readyWaiter: CheckedContinuation<NWPath, Error>?
+
+  init(to endpoint: NWEndpoint, using parameters: NWParameters) {
+    switch endpoint {
+    case .hostPort(let host, _): self.host = host
+    case .url(let url): self.host = NWEndpoint.Host(url.host ?? "")
+    default: self.host = NWEndpoint.Host("")
+    }
+    connection = NWConnection(to: endpoint, using: parameters)
+    connection.start(queue: queue)
+    queue.asyncAfter(deadline: .now() + 8) { [connection] in
+      if case .ready = connection.state { return }
+      connection.cancel()
+    }
+  }
+
+  func cancel() { connection.cancel() }
+
+  /// Waits until the connection is open and returns its path.
+  func ready() async throws -> NWPath {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NWPath, Error>) in
+        queue.async { [self] in
+          readyWaiter = continuation
+          stateChanged(connection.state)
+          connection.stateUpdateHandler = { [self] in stateChanged($0) }
+        }
+      }
+    } onCancel: { [connection] in
+      connection.cancel()
+    }
+  }
+
+  private func stateChanged(_ state: NWConnection.State) {
+    guard let waiter = readyWaiter else { return }
+    switch state {
+    case .ready:
+      readyWaiter = nil
+      if let path = connection.currentPath {
+        waiter.resume(returning: path)
+      } else {
+        waiter.resume(throwing: URLError(.cannotConnectToHost))
+      }
+    case .failed, .cancelled:
+      readyWaiter = nil
+      waiter.resume(throwing: URLError(.cannotConnectToHost))
+    default:
+      break
+    }
+  }
+
+  func send(_ data: Data, context: NWConnection.ContentContext = .defaultMessage) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+        if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+      })
+    }
+  }
+
+  /// Reads the stream until the other side closes it.
+  func receiveAll() async throws -> Data {
+    var result = Data()
+    while true {
+      let (data, complete) = try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<(Data?, Bool), Error>) in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+          if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: (data, isComplete)) }
+        }
+      }
+      if let data { result.append(data) }
+      if complete { return result }
+    }
+  }
+
+  /// Returns the next text or binary WebSocket message.
+  func receiveWebSocketMessage() async throws -> Data {
+    while true {
+      let (data, context) = try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<(Data?, NWConnection.ContentContext?), Error>) in
+        connection.receiveMessage { data, context, _, error in
+          if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: (data, context)) }
+        }
+      }
+      let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
+      switch metadata?.opcode {
+      case .text?, .binary?: return data ?? Data()
+      case .ping?, .pong?, .cont?: continue
+      default: throw HAWebSocketUnavailableError()
+      }
+    }
+  }
+}
+
+/// Sends one HTTP/1.0 request to a local Home Assistant address. The connection opens first, its peer and
+/// network are verified, and only then does the request, with its credentials, go out on that connection.
+enum LocalHTTP {
+  static func data(for request: URLRequest, instanceID: String) async throws -> (Data, URLResponse) {
+    guard let url = request.url, let host = url.host,
+          let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) else { throw URLError(.badURL) }
+    let local = LocalConnection(to: .hostPort(host: NWEndpoint.Host(host), port: port), using: .tcp)
+    return try await withTaskCancellationHandler {
+      defer { local.cancel() }
+      let path = try await local.ready()
+      guard await LocalHomeAssistant.isVerified(path: path, host: local.host, instanceID: instanceID) else {
+        throw URLError(.cannotConnectToHost)
+      }
+      try await local.send(requestData(request, url: url, host: host))
+      let response = try await local.receiveAll()
+      return try parse(response, url: url)
+    } onCancel: {
+      local.cancel()
+    }
+  }
+
+  private static func requestData(_ request: URLRequest, url: URL, host: String) -> Data {
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    var target = components?.percentEncodedPath ?? ""
+    if target.isEmpty { target = "/" }
+    if let query = components?.percentEncodedQuery { target += "?\(query)" }
+    let body = request.httpBody ?? Data()
+    // HTTP/1.0 keeps the response unchunked and ends it by closing the connection.
+    var head = "\(request.httpMethod ?? "GET") \(target) HTTP/1.0\r\n"
+    head += "Host: \(host)\(url.port.map { ":\($0)" } ?? "")\r\nContent-Length: \(body.count)\r\n"
+    for (name, value) in request.allHTTPHeaderFields ?? [:] { head += "\(name): \(value)\r\n" }
+    return Data((head + "\r\n").utf8) + body
+  }
+
+  private static func parse(_ response: Data, url: URL) throws -> (Data, URLResponse) {
+    guard let end = response.range(of: Data("\r\n\r\n".utf8)),
+          let head = String(data: response[..<end.lowerBound], encoding: .utf8) else {
+      throw URLError(.badServerResponse)
+    }
+    let lines = head.components(separatedBy: "\r\n")
+    let status = lines[0].split(separator: " ")
+    var headers: [String: String] = [:]
+    for line in lines.dropFirst() {
+      guard let colon = line.firstIndex(of: ":") else { continue }
+      headers[String(line[..<colon])] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+    }
+    guard status.count >= 2, let code = Int(status[1]),
+          let httpResponse = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.0", headerFields: headers) else {
+      throw URLError(.badServerResponse)
+    }
+    return (Data(response[end.upperBound...]), httpResponse)
   }
 }
