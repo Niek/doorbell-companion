@@ -57,6 +57,8 @@ object HomeAssistantAuth {
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
+        .dns(LocalHomeAssistant.dns)
+        .socketFactory(LocalHomeAssistant.socketFactory)
         .addInterceptor { chain ->
             // Only plain-HTTP calls wait here, on their own thread, so HTTPS calls in the same race start right away.
             val url = chain.request().url

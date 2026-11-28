@@ -1084,8 +1084,14 @@ enum LocalHomeAssistant {
   }
 
   private nonisolated static func query(host: String, expected: Data) async -> Bool {
-    await withCheckedContinuation { continuation in
-      MDNSProbe(host: host, expected: expected) { continuation.resume(returning: $0) }.start()
+    let probe = MDNSProbe(host: host, expected: expected)
+    // A cancelled race stops the probe at once, so the losing branch doesn't hold up the winner.
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        probe.start { continuation.resume(returning: $0) }
+      }
+    } onCancel: {
+      probe.cancel()
     }
   }
 
@@ -1103,34 +1109,46 @@ enum LocalHomeAssistant {
   }
 }
 
-/// Sends the instance-ID query to one address, retries once, and gives up after 0.8 seconds.
-private final class MDNSProbe {
+/// Sends the instance-ID query to one address, retries once, and gives up after 0.8 seconds or when cancelled.
+/// All state changes run on `queue`.
+private final class MDNSProbe: @unchecked Sendable {
   private let connection: NWConnection
   private let expected: Data
   private let queue = DispatchQueue(label: "nl.niek.doorbellcompanion.local-home-assistant")
   private var completion: ((Bool) -> Void)?
+  private var cancelled = false
 
-  init(host: String, expected: Data, completion: @escaping (Bool) -> Void) {
+  init(host: String, expected: Data) {
     connection = NWConnection(host: NWEndpoint.Host(host), port: 5353, using: .udp)
     self.expected = expected
-    self.completion = completion
   }
 
-  func start() {
-    connection.stateUpdateHandler = { [self] state in
-      switch state {
-      case .ready:
-        receive()
-        send()
-        queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
-      case .failed, .cancelled:
-        finish(false)
-      default:
-        break
+  func start(_ completion: @escaping (Bool) -> Void) {
+    queue.async { [self] in
+      self.completion = completion
+      if cancelled { return finish(false) }
+      connection.stateUpdateHandler = { [self] state in
+        switch state {
+        case .ready:
+          receive()
+          send()
+          queue.asyncAfter(deadline: .now() + 0.4) { [self] in send() }
+        case .failed, .cancelled:
+          finish(false)
+        default:
+          break
+        }
       }
+      queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
+      connection.start(queue: queue)
     }
-    queue.asyncAfter(deadline: .now() + 0.8) { [self] in finish(false) }
-    connection.start(queue: queue)
+  }
+
+  func cancel() {
+    queue.async { [self] in
+      cancelled = true
+      finish(false)
+    }
   }
 
   private func send() {
